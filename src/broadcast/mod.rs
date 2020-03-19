@@ -8,6 +8,8 @@ use drop::crypto::key::exchange::PublicKey;
 
 use futures::stream::{self, SelectAll, Stream, StreamExt};
 
+use tracing::{debug, info};
+
 mod besteffort;
 pub use besteffort::BestEffort;
 
@@ -75,10 +77,18 @@ where
         while let Poll::Ready(Some(connection)) =
             self.peer_source.poll_next_unpin(cx)
         {
+            info!("new peer connection for broadcast");
             self.add_peer(connection);
         }
 
-        self.future.poll_next_unpin(cx)
+        debug!("polling for incoming messages");
+        match self.future.poll_next_unpin(cx) {
+            Poll::Ready(Some((pkey, msg))) => {
+                debug!("received {:?} from {}", msg, pkey);
+                Poll::Ready(Some((pkey, msg)))
+            }
+            e => e,
+        }
     }
 }
 

@@ -13,3 +13,8 @@ tokio = "0.2.0"
 tracing = "0.1.13"
 serde = "1.0.102"
 hashbrown = "0.7.0"
+tracing-futures = "0.2.3"
+error-chain = "0.12.2"
+
+[dev-dependencies]
+tracing-subscriber = "*"

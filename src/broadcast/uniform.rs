@@ -2,7 +2,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use super::{BestEffort, Broadcast};
-use crate::{ConnectionManager, Message, System};
+use crate::{Connection as ConnectionManager, Message, System};
 
 use drop::async_trait;
 use drop::crypto::key::exchange::PublicKey;
@@ -12,7 +12,7 @@ use futures::stream::{Stream, StreamExt};
 use hashbrown::hash_map::Entry;
 use hashbrown::{HashMap, HashSet};
 
-/// A `Broadcast` implementation that provides the following guarantess:
+/// A `Broadcast` implementation that provides the following guarantees:
 /// * all correct process will eventually deliver a `Message` broadcasted by a
 /// correct process
 pub struct UniformReliable<M: Message + 'static> {
@@ -20,6 +20,8 @@ pub struct UniformReliable<M: Message + 'static> {
 }
 
 impl<M: Message + 'static> UniformReliable<M> {
+    /// Create a new `UniformReliableBroadcast` with the given besteffort
+    /// broadcast.
     pub fn new(system: System<M>) -> Self {
         let beb = BestEffort::from(system);
 
@@ -40,7 +42,8 @@ impl<M: Message + Unpin> Broadcast<M> for UniformReliable<M> {
             .beb
             .system()
             .peer_source()
-            .filter_map(|x| async { x.ok().map(|c| *c.public()) });
+            .filter_map(|x| async { x.ok() })
+            .boxed();
         let messages = self.beb.incoming().await;
         let initial = self
             .beb
@@ -48,7 +51,7 @@ impl<M: Message + Unpin> Broadcast<M> for UniformReliable<M> {
             .connections()
             .await
             .into_iter()
-            .map(|x| x.public());
+            .map(|x| *x.public());
 
         Box::new(Acker::new(peer_source, messages, initial))
     }
@@ -57,7 +60,7 @@ impl<M: Message + Unpin> Broadcast<M> for UniformReliable<M> {
 struct Acker<M, S, P>
 where
     Self: Unpin,
-    M: Message + Unpin + 'static,
+    M: Message + 'static,
     S: Stream<Item = (PublicKey, M)>,
     P: Stream<Item = ConnectionManager<M>> + Send,
 {
@@ -70,7 +73,7 @@ where
 impl<M, S, P> Acker<M, S, P>
 where
     M: Message + Unpin,
-    S: Stream<Item = (PublicKey, M)> + Unpin + Send,
+    S: Stream<Item = (PublicKey, M)> + Send + Unpin,
     P: Stream<Item = ConnectionManager<M>> + Send + Unpin,
 {
     fn new<I: Iterator<Item = PublicKey>>(
@@ -134,9 +137,8 @@ where
 
 impl<M, S, P> Stream for Acker<M, S, P>
 where
-    Self: Unpin,
     M: Message + Unpin,
-    S: Stream<Item = (PublicKey, M)> + Unpin + Send,
+    S: Stream<Item = (PublicKey, M)> + Send + Unpin,
     P: Stream<Item = ConnectionManager<M>> + Send + Unpin,
 {
     type Item = (PublicKey, M);

@@ -2,6 +2,7 @@ use std::fmt;
 use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::pin::Pin;
+use std::result::Result as StdResult;
 use std::task::{Context, Poll};
 
 use crate::Message;
@@ -10,17 +11,67 @@ use drop::crypto::key::exchange::PublicKey;
 use drop::net::{Connection, ReceiveError, SendError};
 
 use futures::future::{self, Either};
-use futures::{self, FutureExt, Stream};
+use futures::{self, FutureExt, Stream, StreamExt};
 
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::{self, JoinHandle};
 
-use tracing::error;
+use tracing::{debug, error, info, warn};
+
+pub use errors::Error as ConnectionError;
+pub use errors::ErrorKind as ConnectionErrorKind;
+
+use errors::*;
+
+mod errors {
+    use tokio::sync::broadcast::SendError as BcastSendError;
+    use tokio::sync::mpsc::error::SendError;
+
+    error_chain! {
+        errors {
+            Closed {
+                description("connection was closed"),
+            }
+            CorruptedMsg(reason: String) {
+                description("corrupted message"),
+                display("corrupted message: {}", reason),
+            }
+        }
+    }
+
+    impl<T> From<SendError<T>> for Error {
+        fn from(_: SendError<T>) -> Self {
+            ErrorKind::Closed.into()
+        }
+    }
+
+    impl<T> From<BcastSendError<T>> for Error {
+        fn from(_: BcastSendError<T>) -> Self {
+            ErrorKind::Closed.into()
+        }
+    }
+
+    impl From<super::ReceiveError> for Error {
+        fn from(err: super::ReceiveError) -> Self {
+            match err.cause() {
+                _ => todo!(),
+            }
+        }
+    }
+
+    impl From<super::SendError> for Error {
+        fn from(err: super::SendError) -> Self {
+            match err.cause() {
+                _ => todo!(),
+            }
+        }
+    }
+}
 
 enum Action<M: Message + 'static> {
     Send(M),
     Receive(M),
-    Error(HandlerError),
+    Error(Error),
     Close,
 }
 
@@ -50,17 +101,19 @@ impl<M: Message + 'static> ConnectionHandler<M> {
 
     /// Spawn a `Task` that will service the `Connection` associated with this
     /// handler
-    pub fn serve(mut self) -> JoinHandle<Result<(), HandlerError>> {
+    pub fn serve(mut self) -> JoinHandle<Result<()>> {
         task::spawn(async move {
             loop {
-                let send_fut = self.rx.recv().boxed();
-                let recv_fut = self.connection.receive::<M>().boxed();
+                let rx = self.rx.next();
+                let receive = self.connection.receive().boxed();
 
-                match Self::poll(recv_fut, send_fut).await {
+                match Self::poll(receive, rx).await {
                     Some(Action::Send(message)) => {
                         self.connection.send(&message).await?;
                     }
                     Some(Action::Receive(message)) => {
+                        debug!("received {:?} from {}", message, self.public);
+
                         match self.tx.send(message) {
                             Err(e) => {
                                 error!(
@@ -72,7 +125,10 @@ impl<M: Message + 'static> ConnectionHandler<M> {
                             Ok(_) => continue,
                         }
                     }
-                    Some(Action::Close) => return Ok(()),
+                    Some(Action::Close) => {
+                        info!("closing connection to {}", self.public);
+                        return Ok(());
+                    }
                     Some(Action::Error(e)) => return Err(e),
                     None => continue,
                 }
@@ -82,48 +138,21 @@ impl<M: Message + 'static> ConnectionHandler<M> {
 
     async fn poll<RF, SF>(recv_fut: RF, send_fut: SF) -> Option<Action<M>>
     where
-        RF: Future<Output = Result<M, ReceiveError>> + Unpin,
+        RF: Future<Output = StdResult<M, ReceiveError>> + Unpin,
         SF: Future<Output = Option<ConnectionCommand<M>>> + Unpin,
     {
         match future::select(recv_fut, send_fut).await {
-            Either::Left((Ok(message), _)) => {
-                println!("received {:?}", message);
-                Some(Action::Receive(message))
-            }
+            Either::Left((Ok(message), _)) => Some(Action::Receive(message)),
             Either::Left((Err(e), _)) => Some(Action::Error(e.into())),
             Either::Right((Some(cmd), _)) => match cmd {
                 ConnectionCommand::Send(to_send) => Some(Action::Send(to_send)),
                 ConnectionCommand::Close => Some(Action::Close),
                 ConnectionCommand::Ping => None,
             },
-            Either::Right((None, _)) => Some(Action::Error(HandlerError)),
+            Either::Right((None, _)) => {
+                Some(Action::Error(ErrorKind::Closed.into()))
+            }
         }
-    }
-}
-
-pub struct HandlerError;
-
-impl From<ReceiveError> for HandlerError {
-    fn from(_: ReceiveError) -> Self {
-        todo!()
-    }
-}
-
-impl From<SendError> for HandlerError {
-    fn from(_: SendError) -> Self {
-        todo!()
-    }
-}
-
-impl<M> From<mpsc::error::SendError<M>> for HandlerError {
-    fn from(_: mpsc::error::SendError<M>) -> Self {
-        todo!()
-    }
-}
-
-impl<M> From<broadcast::SendError<M>> for HandlerError {
-    fn from(_: broadcast::SendError<M>) -> Self {
-        todo!()
     }
 }
 
@@ -162,16 +191,19 @@ impl<M: Message> ConnectionManager<M> {
     }
 
     /// Send a message on this `Connection`
-    pub async fn send(&self, message: M) -> Result<(), ()> {
+    pub async fn send(&self, message: M) -> Result<()> {
         self.tx
             .clone()
             .send(ConnectionCommand::Send(message))
             .await
-            .map_err(|_| ())
+            .map_err(|_| {
+                error!("no active manager for {}", self.public);
+                ErrorKind::Closed.into()
+            })
     }
 
     /// Close the `Connection` associated with this `ConnectionManager`
-    pub async fn close(&mut self) -> Result<(), HandlerError> {
+    pub async fn close(&mut self) -> Result<()> {
         self.tx
             .send(ConnectionCommand::Close)
             .await
@@ -230,6 +262,8 @@ impl<M: Message> Stream for ConnectionStream<M> {
         mut self: Pin<&mut Self>,
         cx: &mut Context,
     ) -> Poll<Option<Self::Item>> {
+        debug!("polling connection {}", self.public);
+
         match self.rx.poll_recv(cx) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(Ok(v)) => Poll::Ready(Some((self.public, v))),
@@ -237,7 +271,10 @@ impl<M: Message> Stream for ConnectionStream<M> {
                 error!("connection to {} failed", self.public);
                 Poll::Ready(None)
             }
-            Poll::Ready(Err(_)) => self.poll_next(cx),
+            Poll::Ready(Err(_)) => {
+                warn!("connection {} is lagging behind!", self.public);
+                self.poll_next(cx)
+            }
         }
     }
 }
@@ -255,3 +292,52 @@ impl<M: Message> Hash for ConnectionStream<M> {
 }
 
 impl<M: Message> Eq for ConnectionStream<M> {}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use crate::test::*;
+
+    use drop::crypto::key::exchange::Exchanger;
+    use drop::net::{Connector, Listener, TcpConnector, TcpListener};
+
+    use futures::stream::StreamExt;
+
+    #[tokio::test]
+    async fn connection_stream() {
+        init_logger();
+        let addr = next_test_ip4();
+        let exchanger = Exchanger::random();
+        let pkey = *exchanger.keypair().public();
+        let connector = TcpConnector::new(Exchanger::random());
+        let mut listener = TcpListener::new(addr, exchanger.clone())
+            .await
+            .expect("listen failed");
+
+        let handle = task::spawn(async move {
+            let connection = connector
+                .connect(&pkey, &addr)
+                .await
+                .expect("connect failed");
+            let mut manager = ConnectionManager::new(connection, pkey);
+            let mut stream = manager.stream();
+
+            for i in 0..10 {
+                let msg: usize = stream.next().await.expect("recv failed").1;
+
+                assert_eq!(i, msg, "wrong data received");
+            }
+        });
+
+        let connection = listener.accept().await.expect("accept failed");
+        let mut manager = ConnectionManager::new(connection, pkey);
+
+        for i in 0..10 {
+            manager.send(i).await.expect("send failed");
+        }
+
+        manager.close().await.unwrap();
+
+        handle.await.expect("task failure");
+    }
+}

@@ -3,7 +3,7 @@ use std::future::Future;
 
 use super::besteffort::BestEffort;
 use super::*;
-use crate::{ConnectionManager, System};
+use crate::{Connection as ConnectionManager, System};
 
 use drop::async_trait;
 
@@ -83,18 +83,26 @@ where
         }
     }
 
-    async fn broadcast(&mut self, message: &M) {
+    async fn broadcast(&mut self, source: &PublicKey, message: &M) {
         if self.delivered.insert(*message) {
             debug!("retransmitting {:?}", message);
-            future::join_all(self.outgoing.iter().map(|x| x.send(*message)))
-                .await;
+            future::join_all(self.outgoing.iter().filter_map(|x| {
+                if x.public() == source {
+                    None
+                } else {
+                    Some(x.send(*message))
+                }
+            }))
+            .await;
+        } else {
+            debug!("delivery of old message {:?}", message);
         }
     }
 
     async fn start(mut self) {
         loop {
             match Self::poll(
-                self.incoming.next().boxed(),
+                self.incoming.next(),
                 self.peer_source.next().boxed(),
             )
             .await
@@ -103,8 +111,9 @@ where
                     info!("new connection {}", connection);
                     self.outgoing.insert(connection);
                 }
-                Action::Broadcast(ref message) => {
-                    self.broadcast(message).await;
+                Action::Broadcast(ref pkey, ref message) => {
+                    debug!("broadcasting {:?}", message);
+                    self.broadcast(pkey, message).await;
                 }
                 Action::Stop => return,
             }
@@ -119,7 +128,9 @@ where
         match future::select(receive, peer).await {
             Either::Right((Some(connection), _)) => Action::Insert(connection),
             Either::Right((None, _)) => todo!(),
-            Either::Left((Some((_, message)), _)) => Action::Broadcast(message),
+            Either::Left((Some((pkey, message)), _)) => {
+                Action::Broadcast(pkey, message)
+            }
             Either::Left((None, _)) => Action::Stop,
         }
     }
@@ -127,6 +138,64 @@ where
 
 enum Action<M: Message + 'static> {
     Insert(ConnectionManager<M>),
-    Broadcast(M),
+    Broadcast(PublicKey, M),
     Stop,
+}
+
+#[cfg(test)]
+mod test {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+    use crate::broadcast::Broadcast;
+    use crate::test::*;
+    use crate::System;
+
+    use drop::crypto::key::exchange::Exchanger;
+    use drop::net::TcpConnector;
+
+    static DATA: AtomicUsize = AtomicUsize::new(0);
+
+    #[tokio::test]
+    async fn single_message() {
+        init_logger();
+        const SIZE: usize = 10;
+        let mut addrs = test_addrs(SIZE);
+        let public = create_receivers(
+            addrs.clone().into_iter(),
+            |mut connection| async move {
+                let data = DATA.fetch_add(1, Ordering::AcqRel);
+                let mut received = Vec::new();
+                connection.send(&data).await.expect("failed to send");
+
+                for _ in 0..(SIZE - 1) {
+                    let integer =
+                        connection.receive().await.expect("recv failed");
+
+                    received.push(integer);
+                }
+                (0..SIZE).filter(|x| *x != data).for_each(|x| {
+                    assert!(received.contains(&x));
+                })
+            },
+        )
+        .await;
+        let pkeys = public.iter().map(|x| x.0);
+        let connector = TcpConnector::new(Exchanger::random());
+        let system = System::new_with_connector(
+            &connector,
+            pkeys,
+            addrs.drain(..).map(|x| x.1),
+        )
+        .await;
+        let mut bcast = ReliableMultiShot::new(system).await;
+
+        let mut incoming = bcast.incoming().await;
+
+        for _ in 0..10usize {
+            let (_, data) = incoming.next().await.expect("missing message");
+
+            assert!((0..10usize).contains(&data), "wrong message received");
+        }
+    }
 }

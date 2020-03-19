@@ -3,7 +3,6 @@ use std::fmt;
 use std::future::Future;
 
 use super::connection::ConnectionManager;
-
 use super::Message;
 
 use drop::crypto::key::exchange::PublicKey;
@@ -12,12 +11,15 @@ use drop::net::{ConnectError, Connection, Connector, Listener, ListenerError};
 use futures::future;
 
 use tokio::sync::broadcast;
+use tokio::sync::mpsc;
 use tokio::sync::RwLock;
 use tokio::task::{self, JoinHandle};
 
-use tracing::error;
+use tracing::{debug_span, error, info};
+use tracing_futures::Instrument;
 
-/// An abstract distributed `System` that performs some user defined task
+/// A representation of a distributed `System` that manages connections to and
+/// from other peers.
 pub struct System<M: Message + 'static> {
     connections: RwLock<HashMap<PublicKey, ConnectionManager<M>>>,
     peer_tx: broadcast::Sender<ConnectionManager<M>>,
@@ -33,23 +35,31 @@ impl<M: Message + 'static> System<M> {
     >(
         initial: I,
     ) -> Self {
-        let mut iter = initial.into_iter();
-        let keys = iter.by_ref().map(|x| x.0).collect::<Vec<_>>();
-        let connections = future::join_all(iter.map(|x| x.1))
-            .await
-            .drain(..)
-            .zip(keys)
-            .filter_map(|(result, pkey)| match result {
-                Ok(connection) => Some((pkey, connection)),
-                Err(e) => {
-                    error!("failed to connect to {}: {}", pkey, e);
-                    None
-                }
-            })
-            .map(|(pkey, connection)| {
-                (pkey, ConnectionManager::new(connection, pkey))
-            })
-            .collect::<HashMap<_, _>>();
+        let iter = initial.into_iter();
+
+        let connections = future::join_all(iter.map(|x| async {
+            (
+                x.1.instrument(debug_span!("system_connect", dest = %x.0))
+                    .await,
+                x.0,
+            )
+        }))
+        .await
+        .drain(..)
+        .filter_map(|(result, pkey)| match result {
+            Ok(connection) => {
+                info!("connected to {}", pkey);
+                Some((pkey, connection))
+            }
+            Err(e) => {
+                error!("failed to connect to {}: {}", pkey, e);
+                None
+            }
+        })
+        .map(|(pkey, connection)| {
+            (pkey, ConnectionManager::new(connection, pkey))
+        })
+        .collect::<HashMap<_, _>>();
 
         let (peer_tx, _) = broadcast::channel(32);
 
@@ -61,7 +71,7 @@ impl<M: Message + 'static> System<M> {
     }
 
     /// Create a new `System` using a list of peers and some `Connector`
-    pub async fn new_with_connector<
+    pub async fn new_with_connector_zipped<
         C: Connector<Candidate = CD>,
         CD: fmt::Display + Send + Sync,
         I: IntoIterator<Item = (PublicKey, CD)>,
@@ -75,6 +85,25 @@ impl<M: Message + 'static> System<M> {
                 async move { connector.connect(&pkey, &candidate).await },
             )
         }))
+        .await
+    }
+
+    /// Create a new `System` from an iterator of `Candidate`s and another of
+    /// `PublicKey`s
+    pub async fn new_with_connector<
+        C: Connector<Candidate = CD>,
+        CD: fmt::Display + Send + Sync,
+        I1: IntoIterator<Item = PublicKey>,
+        I2: IntoIterator<Item = CD>,
+    >(
+        connector: &C,
+        pkeys: I1,
+        candidates: I2,
+    ) -> Self {
+        Self::new_with_connector_zipped(
+            connector,
+            pkeys.into_iter().zip(candidates),
+        )
         .await
     }
 
@@ -116,6 +145,7 @@ impl<M: Message + 'static> System<M> {
             .zip(candidates.iter().map(|x| x.1))
             .filter_map(|(result, pkey)| match result {
                 Ok(connection) => {
+                    info!("connected to {}", pkey);
                     Some((pkey, ConnectionManager::new(connection, pkey)))
                 }
                 Err(_) => None,
@@ -134,25 +164,33 @@ impl<M: Message + 'static> System<M> {
 
     /// Add a `Listener` to this `System` that will accept incoming peer
     /// `Connection`s
-    pub async fn add_listener<C, L>(&mut self, mut listener: L)
+    pub async fn add_listener<C, L>(
+        &mut self,
+        mut listener: L,
+    ) -> mpsc::Receiver<ListenerError>
     where
         C: fmt::Display + Sync + Send,
         L: Listener<Candidate = C> + 'static,
     {
         let tx = self.peer_tx.clone();
+        let (mut err_tx, err_rx) = mpsc::channel(1);
 
         let handle = task::spawn(async move {
             let tx = tx;
 
             loop {
                 match listener.accept().await {
-                    Err(e) => return Err(e),
+                    Err(e) => {
+                        let _ = err_tx.send(e).await;
+                    }
                     Ok(_) => todo!("insert incoming connections in the system"),
                 }
             }
         });
 
         self.listeners.push(handle);
+
+        err_rx
     }
 
     /// Get a `Stream` that will produce new peers as they join the `System`
@@ -161,13 +199,65 @@ impl<M: Message + 'static> System<M> {
     }
 }
 
-pub(crate) enum PeerChange {
-    Add(PublicKey),
-    Remove(PublicKey),
+impl<M: Message> Default for System<M> {
+    fn default() -> Self {
+        Self {
+            peer_tx: broadcast::channel(32).0,
+            connections: Default::default(),
+            listeners: Default::default(),
+        }
+    }
 }
 
-impl<M: Message> From<ConnectionManager<M>> for PeerChange {
-    fn from(conn: ConnectionManager<M>) -> Self {
-        PeerChange::Add(*conn.public())
+#[cfg(test)]
+mod test {
+    use super::*;
+    use crate::test::*;
+
+    use drop::crypto::key::exchange::Exchanger;
+    use drop::net::TcpConnector;
+
+    #[tokio::test]
+    async fn connect() {
+        todo!()
+    }
+
+    #[tokio::test]
+    async fn add_peers() {
+        init_logger();
+        let addrs = test_addrs(11);
+        let candidates = addrs
+            .clone()
+            .into_iter()
+            .map(|(exchanger, addr)| (addr, *exchanger.keypair().public()))
+            .collect::<Vec<_>>();
+        let receivers =
+            create_receivers(addrs.into_iter(), |mut connection| async move {
+                let data = connection
+                    .receive::<usize>()
+                    .await
+                    .expect("receive failed");
+
+                assert_eq!(data, 0, "wrong data received");
+            })
+            .await;
+        let mut system: System<usize> = Default::default();
+        let connector = TcpConnector::new(Exchanger::random());
+        let mut connections =
+            system.add_peers(&connector, candidates.as_slice()).await;
+
+        future::join_all(connections.iter_mut().map(|x| async move {
+            x.send(0usize).await.expect("send failed");
+        }))
+        .await;
+
+        future::join_all(receivers.into_iter().map(|(_, handle)| handle)).await;
+
+        assert_eq!(connections.len(), 11, "not all connections opened");
+    }
+
+    #[tokio::test]
+    async fn add_listener() {
+        todo!()
     }
 }
