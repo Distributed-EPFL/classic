@@ -48,6 +48,7 @@ impl<M: Message + Unpin + 'static> Broadcast<M> for ReliableMultiShot<M> {
     async fn incoming(
         &mut self,
     ) -> Box<dyn Stream<Item = (PublicKey, M)> + Send + Unpin> {
+        // FIXME: fix multiple delivery of messages
         self.beb.incoming().await
     }
 }
@@ -112,7 +113,6 @@ where
                     self.outgoing.insert(connection);
                 }
                 Action::Broadcast(ref pkey, ref message) => {
-                    debug!("broadcasting {:?}", message);
                     self.broadcast(pkey, message).await;
                 }
                 Action::Stop => return,
@@ -174,6 +174,11 @@ mod test {
 
                     received.push(integer);
                 }
+                assert_eq!(
+                    received.len(),
+                    SIZE - 1,
+                    "wrong number of messages"
+                );
                 (0..SIZE).filter(|x| *x != data).for_each(|x| {
                     assert!(received.contains(&x));
                 })
@@ -197,5 +202,43 @@ mod test {
 
             assert!((0..10usize).contains(&data), "wrong message received");
         }
+    }
+
+    #[tokio::test]
+    async fn many_messages() {
+        let (_, handle, system): (_, _, System<usize>) =
+            create_system(10, |mut connection| async move {
+                for i in 0..10usize {
+                    connection.send(&i).await.expect("send failed");
+                }
+
+                connection
+                    .close()
+                    .await
+                    .expect("connection failed to close");
+            })
+            .await;
+        let mut broadcast = ReliableMultiShot::new(system).await;
+        let mut incoming = broadcast.incoming().await;
+
+        let mut received = Vec::new();
+
+        while received.len() < 10 {
+            received.push(incoming.next().await.unwrap());
+        }
+
+        received.sort();
+
+        let received: Vec<usize> = received.into_iter().map(|x| x.1).collect();
+
+        assert_eq!(
+            received,
+            (0..10).collect::<Vec<_>>(),
+            "bad sequence of messages"
+        );
+
+        handle.await.expect("system failure");
+
+        assert!(incoming.next().await.is_none());
     }
 }
