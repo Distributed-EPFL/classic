@@ -5,6 +5,7 @@ use super::Message;
 
 use drop::async_trait;
 use drop::crypto::key::exchange::PublicKey;
+use drop::net::SendError;
 
 use futures::stream::{self, SelectAll, Stream, StreamExt};
 
@@ -23,73 +24,10 @@ pub use uniform::UniformReliable;
 pub trait Broadcast<M: Message> {
     /// Broadcast a `Message` providing guarantees according to the actual
     /// implementation of this trait.
-    async fn broadcast(&mut self, message: &M) -> Result<(), ()>;
+    async fn broadcast(&mut self, message: &M) -> Vec<(PublicKey, SendError)>;
 
-    /// Get a `Stream` that contains messages broadcasted by other peers in the
-    /// `System`
-    async fn incoming(
-        &mut self,
-    ) -> Box<dyn Stream<Item = (PublicKey, M)> + Send + Unpin>;
-}
-
-/// A stream that produces `Message`s received from other peers in the system.
-pub struct BroadcastStream<M, S>
-where
-    M: Message + 'static,
-    S: Stream<Item = (PublicKey, M)> + Send,
-{
-    future: SelectAll<S>,
-    peer_source: Pin<Box<dyn Stream<Item = S> + Send>>,
-}
-
-impl<M, S> BroadcastStream<M, S>
-where
-    M: Message + 'static,
-    S: Stream<Item = (PublicKey, M)> + Send + Unpin + 'static,
-{
-    pub fn new<I, P>(streams: I, peer_source: P) -> Self
-    where
-        I: Iterator<Item = S>,
-        P: Stream<Item = S> + Send + 'static,
-    {
-        Self {
-            future: stream::select_all(streams),
-            peer_source: Box::pin(peer_source),
-        }
-    }
-
-    pub fn add_peer(&mut self, stream: S) {
-        self.future.push(stream);
-    }
-}
-
-impl<M, S> Stream for BroadcastStream<M, S>
-where
-    M: Message + 'static,
-    S: Stream<Item = (PublicKey, M)> + Unpin + Send + 'static,
-{
-    type Item = (PublicKey, M);
-
-    fn poll_next(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context,
-    ) -> Poll<Option<Self::Item>> {
-        while let Poll::Ready(Some(connection)) =
-            self.peer_source.poll_next_unpin(cx)
-        {
-            info!("new peer connection for broadcast");
-            self.add_peer(connection);
-        }
-
-        debug!("polling for incoming messages");
-        match self.future.poll_next_unpin(cx) {
-            Poll::Ready(Some((pkey, msg))) => {
-                debug!("received {:?} from {}", msg, pkey);
-                Poll::Ready(Some((pkey, msg)))
-            }
-            e => e,
-        }
-    }
+    /// Get a the next delivered `Message` from this `Broadcast` instance
+    async fn delivered(&mut self) -> Option<M>;
 }
 
 #[cfg(test)]
