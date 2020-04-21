@@ -29,7 +29,6 @@ pub trait Message:
     + fmt::Debug
     + Send
     + Sync
-    + Copy
     + Clone
     + Hash
     + PartialEq
