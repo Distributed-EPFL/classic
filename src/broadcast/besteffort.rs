@@ -1,96 +1,214 @@
-use super::{Broadcast, BroadcastStream};
+use std::future::Future;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
+use super::{Broadcaster, Deliverer};
 use crate::{Message, System};
 
 use drop::async_trait;
 use drop::crypto::key::exchange::PublicKey;
+use drop::net::{
+    Connection, ConnectionRead, ConnectionWrite, ReceiveError, SendError,
+};
 
-use futures::future;
-use futures::stream::{Stream, StreamExt};
+use futures::future::{self, FutureExt};
+use futures::stream::{SelectAll, Stream, StreamExt};
 
-use tracing::{debug, debug_span, error, info};
+use tokio::sync::mpsc;
+use tokio::task;
+
+use tracing::{debug, debug_span, error, info, warn};
 use tracing_futures::Instrument;
+
+fn poll_peers<T>(receiver: &mut mpsc::Receiver<T>, dest: &mut Vec<T>) {
+    while let Ok(reader) = receiver.try_recv() {
+        dest.push(reader);
+    }
+}
 
 /// A `Broadcast` implementation that does not provide any guarantee of
 /// reliability.
-pub struct BestEffort<M: Message + 'static> {
-    system: System<M>,
+pub struct BestEffort {}
+
+impl BestEffort {
+    /// Create a new `BestEffort` broadcast that will use the given `System`
+    pub fn with<M: Message + 'static>(
+        mut system: System,
+    ) -> (BestEffortBroadcaster, BestEffortReceiver<M>) {
+        let (readers, writers): (Vec<_>, Vec<_>) = system
+            .connections()
+            .drain(..)
+            .filter_map(|x: Connection| x.split())
+            .unzip();
+
+        info!("creating best effort broadcast primitive");
+
+        let mut peer_source = system.peer_source();
+        let (mut read_tx, read_rx) = mpsc::channel(32);
+        let (mut write_tx, write_rx) = mpsc::channel(32);
+
+        task::spawn(async move {
+            loop {
+                match peer_source.next().await {
+                    Some(connection) => {
+                        if let Some((read, write)) = connection.split() {
+                            match (
+                                read_tx.send(read).await,
+                                write_tx.send(write).await,
+                            ) {
+                                (Ok(_), Ok(_)) => continue,
+                                (Err(_), Ok(_)) => warn!("best effort broadcast receiver dropped early"),
+                                (Ok(_), Err(_)) => warn!("best effort broadcast sender dropped  early"),
+                                (Err(_), Err(_)) => {
+                                    info!("best effort broadcast ending");
+                                    return;
+                                },
+                            }
+                        }
+                    }
+                    None => {
+                        warn!("no new peers can be added");
+                    }
+                }
+            }
+        });
+
+        let receiver = BestEffortReceiver::new(readers, read_rx);
+        let broadcaster = BestEffortBroadcaster::new(writers, write_rx);
+
+        (broadcaster, receiver)
+    }
 }
 
-impl<M: Message + 'static> BestEffort<M> {
-    pub(super) fn new(system: System<M>) -> Self {
-        info!("creating best effort broadcast");
-        Self { system }
+/// The sending end of the best effort broadcast primitive
+pub struct BestEffortBroadcaster {
+    connections: Vec<ConnectionWrite>,
+    peer_source: mpsc::Receiver<ConnectionWrite>,
+}
+
+impl BestEffortBroadcaster {
+    fn new(
+        connections: Vec<ConnectionWrite>,
+        peer_source: mpsc::Receiver<ConnectionWrite>,
+    ) -> Self {
+        Self {
+            connections,
+            peer_source,
+        }
     }
 
-    /// Get a mutable reference to the `System` used by this
-    /// `BestEffortBroadcast`
-    pub fn system(&mut self) -> &mut System<M> {
-        &mut self.system
+    /// Remove all broken `Connections` from this `Broadcaster`
+    pub fn purge(&mut self) {
+        self.connections.retain(|_| todo!());
     }
 }
 
 #[async_trait]
-impl<M: Message> Broadcast<M> for BestEffort<M> {
-    async fn broadcast(&mut self, message: &M) -> Result<(), ()> {
-        let mut values = self.system.connections().await;
+impl<M: Message> Broadcaster<M> for BestEffortBroadcaster {
+    /// Broadcast a `Message` using the best effort strategy.
+    async fn broadcast(&mut self, message: &M) -> Vec<(PublicKey, SendError)> {
+        poll_peers(&mut self.peer_source, &mut self.connections);
 
-        if values.is_empty() {
-            error!("no peers to broadcast to");
-            return Err(());
-        }
+        future::join_all(self.connections.iter_mut().map(|c| {
+            let pkey = *c.remote_pkey();
+            let res = c
+                .send(message)
+                .instrument(debug_span!("peer", dest = %pkey));
 
-        if future::join_all(
-            values.iter_mut().map(|c| {
-                c.send(*message).instrument(debug_span!("sending {:?}"))
-            }),
-        )
+            async move { (pkey, res.await) }
+        }))
+        .instrument(debug_span!("broadcast", message = ?message))
         .await
-        .iter()
-        .any(|x| x.is_err())
-        {
-            error!("failed to send message to at least one peer");
-            Err(())
-        } else {
-            debug!("broadcasted {:?}", message);
-            Ok(())
-        }
-    }
-
-    async fn incoming(
-        &mut self,
-    ) -> Box<dyn Stream<Item = (PublicKey, M)> + Send + Unpin> {
-        let current = self
-            .system
-            .connections()
-            .await
-            .drain(..)
-            .map(|mut x| x.stream())
-            .collect::<Vec<_>>();
-
-        info!(
-            "creating broadcast stream with {} incoming connections",
-            current.len()
-        );
-
-        Box::new(BroadcastStream::new(
-            current.into_iter(),
-            self.system
-                .peer_source()
-                .filter_map(|x| async { x.map(|mut x| x.stream()).ok() }),
-        ))
+        .drain(..)
+        .filter_map(|(pkey, res)| {
+            if let Err(e) = res {
+                Some((pkey, e))
+            } else {
+                None
+            }
+        })
+        .collect()
     }
 }
 
-impl<M: Message> From<System<M>> for BestEffort<M> {
-    fn from(system: System<M>) -> Self {
-        Self::new(system)
+type ReceiverResult<M> = Result<(M, ConnectionRead), (PublicKey, ReceiveError)>;
+
+/// The receiving end of the `BestEffort` broadcast primitive
+pub struct BestEffortReceiver<M: Message + 'static> {
+    connections: SelectAll<MessageStream<M>>,
+    peer_source: mpsc::Receiver<ConnectionRead>,
+}
+
+impl<M: Message + 'static> BestEffortReceiver<M> {
+    fn new(
+        readers: Vec<ConnectionRead>,
+        receiver: mpsc::Receiver<ConnectionRead>,
+    ) -> Self {
+        todo!()
+    }
+}
+
+#[async_trait]
+impl<M: Message + 'static> Deliverer<M> for BestEffortReceiver<M> {
+    async fn deliver(&mut self) -> Option<(PublicKey, M)> {
+        while let Ok(connection) = self.peer_source.try_recv() {
+            self.connections.push(MessageStream::new(connection));
+        }
+
+        self.connections.next().await
+    }
+}
+
+struct MessageStream<M: Message + 'static> {
+    future: Pin<Box<dyn Future<Output = ReceiverResult<M>> + Send>>,
+}
+
+impl<M: Message + 'static> MessageStream<M> {
+    fn new(connection: ConnectionRead) -> Self {
+        Self {
+            future: Self::future_from_read(connection),
+        }
+    }
+
+    fn future_from_read(
+        mut connection: ConnectionRead,
+    ) -> Pin<Box<dyn Future<Output = ReceiverResult<M>> + Send>> {
+        async move {
+            match connection.receive::<M>().await {
+                Ok(message) => Ok((message, connection)),
+                Err(e) => Err((*connection.remote_pkey(), e)),
+            }
+        }
+        .boxed()
+    }
+}
+
+impl<M: Message + 'static> Stream for MessageStream<M> {
+    type Item = (PublicKey, M);
+
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context,
+    ) -> Poll<Option<(PublicKey, M)>> {
+        match self.future.poll_unpin(cx) {
+            Poll::Ready(Ok((message, connection))) => {
+                let pkey = *connection.remote_pkey();
+                self.future = Self::future_from_read(connection);
+                Poll::Ready(Some((pkey, message)))
+            }
+            Poll::Ready(Err((pkey, err))) => {
+                error!("error receiving message from {}: {}", pkey, err);
+                Poll::Ready(None)
+            }
+            Poll::Pending => Poll::Pending,
+        }
     }
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::broadcast::Broadcast;
+    use crate::broadcast::Broadcaster;
     use crate::test::*;
     use crate::System;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -100,6 +218,8 @@ mod test {
 
     use tracing::debug_span;
     use tracing_futures::Instrument;
+
+    impl Message for usize {}
 
     #[tokio::test]
     async fn single_shot() {
@@ -121,14 +241,13 @@ mod test {
         let handles = public.drain(..).map(|x| x.1);
         let candidates = pkeys.into_iter().zip(addrs.drain(..).map(|x| x.1));
 
-        let system: System<usize> =
+        let system: System =
             System::new_with_connector_zipped(&tcp, candidates).await;
-        let mut broadcast = BestEffort::new(system);
+        let (mut sender, receiver) = BestEffort::with::<usize>(system);
 
-        broadcast
-            .broadcast(&0usize)
-            .await
-            .expect("failed to broadcast");
+        let errors = sender.broadcast(&0usize).await;
+
+        assert!(errors.is_empty(), "broadcast failed");
 
         future::join_all(handles.into_iter())
             .await
@@ -158,15 +277,13 @@ mod test {
         let handles = public.drain(..).map(|x| x.1);
         let candidates = pkeys.into_iter().zip(addrs.drain(..).map(|x| x.1));
 
-        let system: System<usize> =
+        let system: System =
             System::new_with_connector_zipped(&tcp, candidates).await;
 
-        let mut broadcast = BestEffort::new(system);
-
-        let mut incoming = broadcast.incoming().await;
+        let (mut broadcast, mut receiver) = BestEffort::with::<usize>(system);
 
         for _ in 0..10usize {
-            let (_, data) = incoming.next().await.expect("early eof");
+            let (_, data) = receiver.deliver().await.expect("early eof");
             assert!((0..10usize).contains(&data), "invalid data broadcasted");
         }
 
