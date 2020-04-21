@@ -1,32 +1,30 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
-
-use super::connection::ConnectionManager;
-use super::Message;
+use std::net::Ipv4Addr;
 
 use drop::crypto::key::exchange::PublicKey;
 use drop::net::{ConnectError, Connection, Connector, Listener, ListenerError};
 
 use futures::future;
+use futures::stream::{select_all, Stream};
 
-use tokio::sync::broadcast;
 use tokio::sync::mpsc;
-use tokio::sync::RwLock;
 use tokio::task::{self, JoinHandle};
 
-use tracing::{debug_span, error, info};
+use tracing::{debug_span, error, info, warn};
 use tracing_futures::Instrument;
 
 /// A representation of a distributed `System` that manages connections to and
 /// from other peers.
-pub struct System<M: Message + 'static> {
-    connections: RwLock<HashMap<PublicKey, ConnectionManager<M>>>,
-    peer_tx: broadcast::Sender<ConnectionManager<M>>,
+pub struct System {
+    connections: HashMap<PublicKey, Connection>,
     listeners: Vec<JoinHandle<Result<(), ListenerError>>>,
+    listener_handles: Vec<JoinHandle<Result<(), ListenerError>>>,
+    peer_input: Vec<mpsc::Receiver<Connection>>,
 }
 
-impl<M: Message + 'static> System<M> {
+impl System {
     /// Create a new `System` using an `Iterator` over pairs of `PublicKey`s and
     /// `Connection` `Future`s
     pub async fn new<
@@ -56,18 +54,14 @@ impl<M: Message + 'static> System<M> {
                 None
             }
         })
-        .map(|(pkey, connection)| {
-            (pkey, ConnectionManager::new(connection, pkey))
-        })
+        .map(|(pkey, connection)| (pkey, connection))
         .collect::<HashMap<_, _>>();
 
-        let (peer_tx, _) = broadcast::channel(32);
+        let mut result = Self::default();
 
-        Self {
-            connections: RwLock::new(connections),
-            listeners: Vec::new(),
-            peer_tx,
-        }
+        result.connections = connections;
+
+        result
     }
 
     /// Create a new `System` using a list of peers and some `Connector`
@@ -120,10 +114,8 @@ impl<M: Message + 'static> System<M> {
         C: Connector<Candidate = CD>,
     {
         let connection = connector.connect_any(public, candidates).await?;
-        let manager = ConnectionManager::new(connection, *public);
 
-        let _ = self.peer_tx.send(manager.clone());
-        self.connections.write().await.insert(*public, manager);
+        self.connections.insert(*public, connection);
 
         Ok(())
     }
@@ -133,33 +125,31 @@ impl<M: Message + 'static> System<M> {
         &mut self,
         connector: &C,
         candidates: &[(CD, PublicKey)],
-    ) -> Vec<ConnectionManager<M>>
+    ) -> impl Iterator<Item = ConnectError>
     where
         CD: fmt::Display + Send + Sync,
         C: Connector<Candidate = CD>,
     {
-        let iter = connector
+        let (ok, err): (Vec<_>, Vec<_>) = connector
             .connect_many(candidates)
             .await
             .drain(..)
             .zip(candidates.iter().map(|x| x.1))
-            .filter_map(|(result, pkey)| match result {
+            .map(|(result, pkey)| match result {
                 Ok(connection) => {
                     info!("connected to {}", pkey);
-                    Some((pkey, ConnectionManager::new(connection, pkey)))
+                    Ok((pkey, connection))
                 }
-                Err(_) => None,
+                Err(e) => {
+                    error!("failed to connect to {}: {}", pkey, e);
+                    Err(e)
+                }
             })
-            .collect::<Vec<_>>();
+            .partition(Result::is_ok);
 
-        self.connections.write().await.extend(iter.iter().cloned());
+        self.connections.extend(ok.into_iter().map(Result::unwrap));
 
-        iter.into_iter().map(|x| x.1).collect()
-    }
-
-    /// Get a list of all `Connection`s currently established
-    pub async fn connections(&self) -> Vec<ConnectionManager<M>> {
-        self.connections.write().await.values().cloned().collect()
+        err.into_iter().map(Result::unwrap_err)
     }
 
     /// Add a `Listener` to this `System` that will accept incoming peer
@@ -167,44 +157,61 @@ impl<M: Message + 'static> System<M> {
     pub async fn add_listener<C, L>(
         &mut self,
         mut listener: L,
-    ) -> mpsc::Receiver<ListenerError>
+    ) -> impl Stream<Item = ListenerError>
     where
         C: fmt::Display + Sync + Send,
         L: Listener<Candidate = C> + 'static,
     {
-        let tx = self.peer_tx.clone();
         let (mut err_tx, err_rx) = mpsc::channel(1);
+        let (mut peer_tx, peer_rx) = mpsc::channel(32);
 
         let handle = task::spawn(async move {
-            let tx = tx;
-
             loop {
                 match listener.accept().await {
                     Err(e) => {
-                        let _ = err_tx.send(e).await;
+                        if err_tx.send(e).await.is_err() {
+                            warn!(
+                                "lost error from listener on {}",
+                                listener.local_addr().unwrap_or(
+                                    (Ipv4Addr::UNSPECIFIED, 0).into()
+                                )
+                            );
+                        }
                     }
-                    Ok(_) => todo!("insert incoming connections in the system"),
+                    Ok(connection) => {
+                        let _ = peer_tx.send(connection).await;
+                    }
                 }
             }
         });
 
+        self.peer_input.push(peer_rx);
         self.listeners.push(handle);
 
         err_rx
     }
 
-    /// Get a `Stream` that will produce new peers as they join the `System`
-    pub fn peer_source(&mut self) -> broadcast::Receiver<ConnectionManager<M>> {
-        self.peer_tx.subscribe()
+    /// Get all the `Connection`s known to this `System`.
+    /// The returned `Connection`s will be removed from the system.
+    pub fn connections(&mut self) -> Vec<Connection> {
+        self.connections.drain().map(|x| x.1).collect()
+    }
+
+    /// Get a `Stream` that produces incoming `Connection`s from all registered
+    /// `Listener`s. Subsequent calls to this method will only produces peers
+    /// from `Listener`s that have been added *after* the previous call.
+    pub fn peer_source(&mut self) -> impl Stream<Item = Connection> {
+        select_all(self.peer_input.drain(..))
     }
 }
 
-impl<M: Message> Default for System<M> {
+impl Default for System {
     fn default() -> Self {
         Self {
-            peer_tx: broadcast::channel(32).0,
             connections: Default::default(),
             listeners: Default::default(),
+            listener_handles: Vec::new(),
+            peer_input: Vec::new(),
         }
     }
 }
@@ -241,13 +248,16 @@ mod test {
                 assert_eq!(data, 0, "wrong data received");
             })
             .await;
-        let mut system: System<usize> = Default::default();
+        let mut system: System = Default::default();
         let connector = TcpConnector::new(Exchanger::random());
-        let mut connections =
-            system.add_peers(&connector, candidates.as_slice()).await;
+        let mut errors = system.add_peers(&connector, &candidates).await;
 
-        future::join_all(connections.iter_mut().map(|x| async move {
-            x.send(0usize).await.expect("send failed");
+        let connections = system.connections();
+
+        assert_eq!(errors.count(), 0, "error connecting to peers");
+
+        future::join_all(connections.iter().map(|x| async move {
+            x.send(&0usize).await.expect("send failed");
         }))
         .await;
 
