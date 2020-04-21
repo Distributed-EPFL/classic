@@ -16,10 +16,6 @@ mod broadcast;
 pub use broadcast::BestEffort;
 pub use broadcast::ReliableMultiShot;
 
-mod connection;
-pub use connection::ConnectionManager as Connection;
-pub use connection::ConnectionStream;
-
 mod system;
 pub use system::System;
 
