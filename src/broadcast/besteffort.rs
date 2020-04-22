@@ -12,12 +12,12 @@ use drop::net::{
 };
 
 use futures::future::{self, FutureExt};
-use futures::stream::{SelectAll, Stream, StreamExt};
+use futures::stream::{self, SelectAll, Stream, StreamExt};
 
 use tokio::sync::mpsc;
 use tokio::task;
 
-use tracing::{debug, debug_span, error, info, warn};
+use tracing::{debug_span, error, info, warn};
 use tracing_futures::Instrument;
 
 fn poll_peers<T>(receiver: &mut mpsc::Receiver<T>, dest: &mut Vec<T>) {
@@ -60,7 +60,7 @@ impl BestEffort {
                                 (Err(_), Ok(_)) => warn!("best effort broadcast receiver dropped early"),
                                 (Ok(_), Err(_)) => warn!("best effort broadcast sender dropped  early"),
                                 (Err(_), Err(_)) => {
-                                    info!("best effort broadcast ending");
+                                    info!("best effort broadcast stopped");
                                     return;
                                 },
                             }
@@ -68,6 +68,7 @@ impl BestEffort {
                     }
                     None => {
                         warn!("no new peers can be added");
+                        return;
                     }
                 }
             }
@@ -140,11 +141,18 @@ pub struct BestEffortReceiver<M: Message + 'static> {
 }
 
 impl<M: Message + 'static> BestEffortReceiver<M> {
-    fn new(
-        readers: Vec<ConnectionRead>,
-        receiver: mpsc::Receiver<ConnectionRead>,
+    fn new<I: IntoIterator<Item = ConnectionRead>>(
+        readers: I,
+        peer_source: mpsc::Receiver<ConnectionRead>,
     ) -> Self {
-        todo!()
+        let connections = readers.into_iter().map(MessageStream::new);
+
+        let connections = stream::select_all(connections);
+
+        Self {
+            connections,
+            peer_source,
+        }
     }
 }
 
@@ -243,13 +251,13 @@ mod test {
 
         let system: System =
             System::new_with_connector_zipped(&tcp, candidates).await;
-        let (mut sender, receiver) = BestEffort::with::<usize>(system);
+        let (mut sender, _) = BestEffort::with::<usize>(system);
 
         let errors = sender.broadcast(&0usize).await;
 
         assert!(errors.is_empty(), "broadcast failed");
 
-        future::join_all(handles.into_iter())
+        future::join_all(handles)
             .await
             .drain(..)
             .collect::<Result<Vec<_>, _>>()
@@ -280,7 +288,7 @@ mod test {
         let system: System =
             System::new_with_connector_zipped(&tcp, candidates).await;
 
-        let (mut broadcast, mut receiver) = BestEffort::with::<usize>(system);
+        let (_, mut receiver) = BestEffort::with::<usize>(system);
 
         for _ in 0..10usize {
             let (_, data) = receiver.deliver().await.expect("early eof");
