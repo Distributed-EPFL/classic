@@ -20,7 +20,7 @@ use tracing_futures::Instrument;
 pub struct System {
     connections: HashMap<PublicKey, Connection>,
     listeners: Vec<JoinHandle<Result<(), ListenerError>>>,
-    listener_handles: Vec<JoinHandle<Result<(), ListenerError>>>,
+    _listener_handles: Vec<JoinHandle<Result<(), ListenerError>>>,
     peer_input: Vec<mpsc::Receiver<Connection>>,
 }
 
@@ -165,25 +165,27 @@ impl System {
         let (mut err_tx, err_rx) = mpsc::channel(1);
         let (mut peer_tx, peer_rx) = mpsc::channel(32);
 
-        let handle = task::spawn(async move {
-            loop {
-                match listener.accept().await {
-                    Err(e) => {
-                        if err_tx.send(e).await.is_err() {
-                            warn!(
-                                "lost error from listener on {}",
-                                listener.local_addr().unwrap_or(
-                                    (Ipv4Addr::UNSPECIFIED, 0).into()
-                                )
-                            );
+        let handle =
+            task::spawn(async move {
+                loop {
+                    match listener.accept().await {
+                        Err(e) => {
+                            if let Err(e) = err_tx.send(e).await {
+                                warn!(
+                                    "lost error from listener on {}: {}",
+                                    listener.local_addr().unwrap_or_else(
+                                        || (Ipv4Addr::UNSPECIFIED, 0).into()
+                                    ),
+                                    e,
+                                );
+                            }
+                        }
+                        Ok(connection) => {
+                            let _ = peer_tx.send(connection).await;
                         }
                     }
-                    Ok(connection) => {
-                        let _ = peer_tx.send(connection).await;
-                    }
                 }
-            }
-        });
+            });
 
         self.peer_input.push(peer_rx);
         self.listeners.push(handle);
@@ -210,7 +212,7 @@ impl Default for System {
         Self {
             connections: Default::default(),
             listeners: Default::default(),
-            listener_handles: Vec::new(),
+            _listener_handles: Vec::new(),
             peer_input: Vec::new(),
         }
     }
@@ -222,12 +224,9 @@ mod test {
     use crate::test::*;
 
     use drop::crypto::key::exchange::Exchanger;
-    use drop::net::TcpConnector;
+    use drop::net::{TcpConnector, TcpListener};
 
-    #[tokio::test]
-    async fn connect() {
-        todo!()
-    }
+    use futures::StreamExt;
 
     #[tokio::test]
     async fn add_peers() {
@@ -250,13 +249,13 @@ mod test {
             .await;
         let mut system: System = Default::default();
         let connector = TcpConnector::new(Exchanger::random());
-        let mut errors = system.add_peers(&connector, &candidates).await;
+        let errors = system.add_peers(&connector, &candidates).await;
 
-        let connections = system.connections();
+        let mut connections = system.connections();
 
         assert_eq!(errors.count(), 0, "error connecting to peers");
 
-        future::join_all(connections.iter().map(|x| async move {
+        future::join_all(connections.iter_mut().map(|x| async move {
             x.send(&0usize).await.expect("send failed");
         }))
         .await;
@@ -268,6 +267,39 @@ mod test {
 
     #[tokio::test]
     async fn add_listener() {
-        todo!()
+        let mut system = System::default();
+        let (exchanger, addr) = test_addrs(1).pop().unwrap();
+        let pkey = *exchanger.keypair().public();
+
+        let _ = system
+            .add_listener(
+                TcpListener::new(addr, exchanger)
+                    .await
+                    .expect("listen failed"),
+            )
+            .await;
+
+        let exchanger = Exchanger::random();
+        let client_pkey = *exchanger.keypair().public();
+        let connector = TcpConnector::new(exchanger);
+
+        connector
+            .connect(&pkey, &addr)
+            .await
+            .expect("connect failed");
+
+        assert_eq!(system.peer_input.len(), 1, "listener not added to system");
+
+        let peer = system
+            .peer_source()
+            .next()
+            .await
+            .expect("unexpected end of stream");
+
+        assert_eq!(
+            peer.remote_key().unwrap(),
+            client_pkey,
+            "different addresses"
+        );
     }
 }

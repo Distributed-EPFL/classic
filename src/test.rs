@@ -3,7 +3,7 @@ use std::future::Future;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicU16, Ordering};
 
-use crate::{Message, System};
+use crate::System;
 
 use drop::crypto::key::exchange::{Exchanger, PublicKey};
 use drop::net::{Connection, Listener, TcpConnector, TcpListener};
@@ -30,7 +30,7 @@ pub fn init_logger() {
 pub fn next_test_ip4() -> SocketAddr {
     (
         Ipv4Addr::LOCALHOST,
-        9000 + PORT_OFFSET.fetch_add(1, Ordering::AcqRel),
+        10000 + PORT_OFFSET.fetch_add(1, Ordering::AcqRel),
     )
         .into()
 }
@@ -74,13 +74,12 @@ pub async fn create_receivers<
 }
 
 pub async fn create_system<
-    M: Message + 'static,
     C: Fn(Connection) -> F + Clone + Sync + Send + 'static,
     F: Future<Output = ()> + Send + Sync,
 >(
     size: usize,
     closure: C,
-) -> (Vec<(PublicKey, SocketAddr)>, JoinHandle<()>, System<M>) {
+) -> (Vec<(PublicKey, SocketAddr)>, JoinHandle<()>, System) {
     init_logger();
     let tcp = TcpConnector::new(Exchanger::random());
     let mut addrs = test_addrs(size);
