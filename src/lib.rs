@@ -4,9 +4,6 @@
 //! This crate provides common abstraction used in distributed systems
 //! on top of the lower level `drop` crate.
 
-#[macro_use]
-extern crate error_chain;
-
 use std::fmt;
 use std::hash::Hash;
 
