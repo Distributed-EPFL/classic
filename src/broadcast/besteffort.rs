@@ -52,10 +52,10 @@ impl BestEffort {
                 match peer_source.next().await {
                     Some(connection) => {
                         if let Some((read, write)) = connection.split() {
-                            match (
-                                read_tx.send(read).await,
-                                write_tx.send(write).await,
-                            ) {
+                            let input = read_tx.send(read).await;
+                            let output = write_tx.send(write).await;
+
+                            match (input, output) {
                                 (Ok(_), Ok(_)) => continue,
                                 (Err(_), Ok(_)) => warn!("best effort broadcast receiver dropped early"),
                                 (Ok(_), Err(_)) => warn!("best effort broadcast sender dropped  early"),
