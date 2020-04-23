@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
 use super::besteffort::*;
-use super::{Broadcaster, Deliverer};
+use super::{BroadcastError, Broadcaster, Deliverer};
 use crate::{Message, System};
 
 use drop::async_trait;
@@ -121,7 +121,7 @@ impl<M: Message + 'static> BroadcastTask<M> {
         broadcast: mpsc::Receiver<M>,
         rebroadcast: mpsc::Receiver<M>,
     ) -> (
-        mpsc::Receiver<Option<Vec<(PublicKey, SendError)>>>,
+        mpsc::Receiver<BroadcastError>,
         JoinHandle<BestEffortBroadcaster>,
     ) {
         let (errors, errors_rx) = mpsc::channel(1);
