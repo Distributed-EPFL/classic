@@ -41,15 +41,17 @@ impl ReliableMultiShot {
     }
 }
 
+/// The sending end of the `ReliableMultiShot` broadcast primitive.
+/// See `ReliableMultiShot` for more.
 pub struct ReliableMultiShotBroadcaster<M: Message + 'static> {
     broadcast_out: mpsc::Sender<M>,
-    errors_in: mpsc::Receiver<Vec<(PublicKey, SendError)>>,
+    errors_in: mpsc::Receiver<Option<Vec<(PublicKey, SendError)>>>,
 }
 
 impl<M: Message + 'static> ReliableMultiShotBroadcaster<M> {
     fn new(
         broadcast_out: mpsc::Sender<M>,
-        errors_in: mpsc::Receiver<Vec<(PublicKey, SendError)>>,
+        errors_in: mpsc::Receiver<Option<Vec<(PublicKey, SendError)>>>,
     ) -> Self {
         Self {
             broadcast_out,
@@ -60,12 +62,16 @@ impl<M: Message + 'static> ReliableMultiShotBroadcaster<M> {
 
 #[async_trait]
 impl<M: Message> Broadcaster<M> for ReliableMultiShotBroadcaster<M> {
-    async fn broadcast(&mut self, message: &M) -> Vec<(PublicKey, SendError)> {
+    async fn broadcast(
+        &mut self,
+        message: &M,
+    ) -> Option<Vec<(PublicKey, SendError)>> {
         if let Err(e) = self.broadcast_out.send(message.clone()).await {
             error!("no broadcast task running: {}", e);
+            None
+        } else {
+            self.errors_in.recv().await.unwrap_or(None)
         }
-
-        self.errors_in.recv().await.unwrap_or_else(Vec::new)
     }
 }
 
@@ -105,7 +111,7 @@ impl<M: Message + 'static> Deliverer<M> for ReliableMultiShotDeliverer<M> {
 struct BroadcastTask<M: Message + 'static> {
     rebroadcast: mpsc::Receiver<M>,
     broadcast: mpsc::Receiver<M>,
-    errors: mpsc::Sender<Vec<(PublicKey, SendError)>>,
+    errors: mpsc::Sender<Option<Vec<(PublicKey, SendError)>>>,
     beb: BestEffortBroadcaster,
 }
 
@@ -115,7 +121,7 @@ impl<M: Message + 'static> BroadcastTask<M> {
         broadcast: mpsc::Receiver<M>,
         rebroadcast: mpsc::Receiver<M>,
     ) -> (
-        mpsc::Receiver<Vec<(PublicKey, SendError)>>,
+        mpsc::Receiver<Option<Vec<(PublicKey, SendError)>>>,
         JoinHandle<BestEffortBroadcaster>,
     ) {
         let (errors, errors_rx) = mpsc::channel(1);

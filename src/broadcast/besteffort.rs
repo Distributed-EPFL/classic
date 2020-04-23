@@ -107,10 +107,17 @@ impl BestEffortBroadcaster {
 #[async_trait]
 impl<M: Message> Broadcaster<M> for BestEffortBroadcaster {
     /// Broadcast a `Message` using the best effort strategy.
-    async fn broadcast(&mut self, message: &M) -> Vec<(PublicKey, SendError)> {
+    async fn broadcast(
+        &mut self,
+        message: &M,
+    ) -> Option<Vec<(PublicKey, SendError)>> {
         poll_peers(&mut self.peer_source, &mut self.connections);
 
-        future::join_all(self.connections.iter_mut().map(|c| {
+        if self.connections.is_empty() {
+            return None;
+        }
+
+        let errors = future::join_all(self.connections.iter_mut().map(|c| {
             let pkey = *c.remote_pkey();
             let res = c
                 .send(message)
@@ -128,7 +135,9 @@ impl<M: Message> Broadcaster<M> for BestEffortBroadcaster {
                 None
             }
         })
-        .collect()
+        .collect();
+
+        Some(errors)
     }
 }
 
@@ -255,7 +264,10 @@ mod test {
 
         let errors = sender.broadcast(&0usize).await;
 
-        assert!(errors.is_empty(), "broadcast failed");
+        assert!(
+            errors.expect("bcast failure").is_empty(),
+            "broadcast failed"
+        );
 
         future::join_all(handles)
             .await
