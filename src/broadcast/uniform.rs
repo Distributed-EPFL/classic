@@ -5,6 +5,9 @@ use drop::async_trait;
 use drop::crypto::key::exchange::PublicKey;
 use drop::net::SendError;
 
+use futures::future::Either;
+use futures::FutureExt;
+
 use hashbrown::hash_map::Entry;
 use hashbrown::{HashMap, HashSet};
 
@@ -109,7 +112,7 @@ where
         msg_tx: mpsc::Sender<(PublicKey, M)>,
         msg_rx: mpsc::Receiver<M>,
         error_tx: mpsc::Sender<BroadcastError>,
-    ) -> JoinHandle<D> {
+    ) -> JoinHandle<(B, D)> {
         let task = Self {
             incoming,
             outgoing,
@@ -124,7 +127,7 @@ where
 
     fn can_deliver(&mut self, pkey: &PublicKey, message: &M) -> bool {
         match self.pending.entry(message.clone()) {
-            Entry::Occupied(e) => todo!(),
+            Entry::Occupied(_) => todo!(),
             Entry::Vacant(e) => {
                 let mut new_acks = HashSet::default();
                 new_acks.insert(*pkey);
@@ -135,18 +138,41 @@ where
         }
     }
 
-    fn task(mut self) -> JoinHandle<D> {
+    async fn poll(&mut self) -> Either<Option<(PublicKey, M)>, Option<M>> {
+        futures::select! {
+            out = self.msg_rx.recv().fuse() => Either::Right(out),
+            r#in = self.incoming.deliver().fuse() => Either::Left(r#in),
+        }
+    }
+
+    fn task(mut self) -> JoinHandle<(B, D)> {
         task::spawn(async move {
             loop {
-                match self.incoming.deliver().await {
-                    None => return self.incoming,
-                    Some((ref pkey, ref msg)) => {
-                        if self.can_deliver(pkey, msg) {
-                            todo!()
+                match self.poll().await {
+                    Either::Right(Some(ref msg)) => {
+                        let result = self.outgoing.broadcast(msg).await;
+                        if self.error_tx.send(result).await.is_err() {
+                            warn!("broadcaster has been dropped");
+                            break;
                         }
+                    }
+                    Either::Right(None) => todo!(),
+                    Either::Left(Some((pkey, msg))) => {
+                        if self.can_deliver(&pkey, &msg)
+                            && self.msg_tx.send((pkey, msg)).await.is_err()
+                        {
+                            warn!("no more incoming messages");
+                            break;
+                        }
+                    }
+                    Either::Left(None) => {
+                        warn!("end of broadcast stream");
+                        break;
                     }
                 }
             }
+
+            (self.outgoing, self.incoming)
         })
     }
 }
