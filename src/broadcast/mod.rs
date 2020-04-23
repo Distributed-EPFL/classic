@@ -13,14 +13,28 @@ use futures::future::{Fuse, FusedFuture, FutureExt};
 use futures::sink::Sink;
 use futures::stream::{self, Stream, StreamExt};
 
+use tokio::sync::broadcast;
+use tokio::task;
+
+use tracing::{debug_span, warn};
+use tracing_futures::Instrument;
+
 mod besteffort;
-pub use besteffort::BestEffort;
+pub use besteffort::{BestEffort, BestEffortBroadcaster, BestEffortReceiver};
 
 mod multishot;
 pub use multishot::ReliableMultiShot;
 
-// mod uniform;
-// pub use uniform::UniformReliable;
+mod uniform;
+pub use uniform::UniformReliable;
+
+/// This is the error type returned by `Broadcaster::broadcast`.
+/// If this value is `None` the `Broadcaster` is not in an usable state anymore
+/// and should be dropped.
+/// In case of a `Some` value it indicates which `Connection` failed by
+/// providing pairs of `PublicKey` and a detailed error value. An empty `Vec`
+/// indicates that no send failures were encountered.
+pub type BroadcastError = Option<Vec<(PublicKey, SendError)>>;
 
 /// This trait is used to broadcast `Message`s providing guarantees depending on
 /// the actual implementation of the trait.
@@ -39,6 +53,9 @@ pub trait Broadcaster<M: Message>: Send {
         message: &M,
     ) -> Option<Vec<(PublicKey, SendError)>>;
 
+    /// Transform this `Broadcaster` into a `Sink` that can be used with the
+    /// adpaters from  the `futures` crate. `Message`s consumed by the `Sink`
+    /// will be broadcasted using the `Broadcaster`.
     fn to_sink(self) -> BroadcastSink<Self, M>
     where
         Self: Sized + 'static,
@@ -154,7 +171,7 @@ where
 
 /// A `Deliverer` is the receiving end of the broadcast primitive.
 #[async_trait]
-pub trait Deliverer<M: Message + 'static> {
+pub trait Deliverer<M: Message + 'static>: Send {
     /// Get the next delivered `Message` on the provided `System`. Returns
     /// `None` if no further  `Message`s can be received using this `Deliverer`.
     async fn deliver(&mut self) -> Option<(PublicKey, M)>;
@@ -173,6 +190,71 @@ pub trait Deliverer<M: Message + 'static> {
             }
         })
         .boxed()
+    }
+}
+
+/// A wrapper for `Deliverer`s that creates two new `Deliverer` that will each
+/// deliver the same set of `Message`s. `Message`s are `Clone`d and sent to each
+/// instance of the `Duplicator`. This may cause performance and memory issues
+/// if a `Deliverer` is duplicated  too many times, especially if the `Message`
+/// type is big.
+pub struct Duplicator<D: Deliverer<M>, M: Message + 'static> {
+    _d: PhantomData<D>,
+    msg_rx: broadcast::Receiver<(PublicKey, M)>,
+}
+
+impl<D: Deliverer<M> + 'static, M: Message + 'static> Duplicator<D, M> {
+    /// Create a new `Duplicator` from another `Deliverer`
+    pub fn duplicate(mut deliverer: D) -> (Self, Self) {
+        let (msg_tx, msg_rx) = broadcast::channel(32);
+        let msg_rx2 = msg_tx.subscribe();
+
+        let first = Self {
+            msg_rx,
+            _d: PhantomData,
+        };
+        let second = Self {
+            msg_rx: msg_rx2,
+            _d: PhantomData,
+        };
+
+        task::spawn(async move {
+            while let Some(v) = deliverer.deliver().await {
+                match msg_tx.send(v) {
+                    Ok(v) => {
+                        debug_assert_eq!(
+                            v, 2,
+                            "incorrect number of subscribers"
+                        );
+                    }
+                    Err(broadcast::SendError(msg)) => {
+                        warn!("all receivers dropped, lost message {:?}", msg);
+                        return;
+                    }
+                }
+            }
+        });
+
+        (first, second)
+    }
+}
+
+#[async_trait]
+impl<D: Deliverer<M>, M: Message + 'static> Deliverer<M> for Duplicator<D, M> {
+    async fn deliver(&mut self) -> Option<(PublicKey, M)> {
+        match self
+            .msg_rx
+            .recv()
+            .instrument(debug_span!("duplicator"))
+            .await
+        {
+            Ok(msg) => Some(msg),
+            Err(broadcast::RecvError::Closed) => None,
+            Err(broadcast::RecvError::Lagged(count)) => {
+                warn!("delivery lagging  behind by {} messages", count);
+                None
+            }
+        }
     }
 }
 
