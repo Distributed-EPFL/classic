@@ -1,102 +1,130 @@
-use std::pin::Pin;
-use std::task::{Context, Poll};
-
-use super::{BestEffort, Broadcast};
-use crate::{Connection as ConnectionManager, Message, System};
+use super::{BestEffort, BroadcastError, Broadcaster, Deliverer};
+use crate::{Message, System};
 
 use drop::async_trait;
 use drop::crypto::key::exchange::PublicKey;
-
-use futures::stream::{Stream, StreamExt};
+use drop::net::SendError;
 
 use hashbrown::hash_map::Entry;
 use hashbrown::{HashMap, HashSet};
 
+use tokio::sync::mpsc;
+use tokio::task::{self, JoinHandle};
+
+use tracing::warn;
+
 /// A `Broadcast` implementation that provides the following guarantees:
 /// * all correct process will eventually deliver a `Message` broadcasted by a
 /// correct process
-pub struct UniformReliable<M: Message + 'static> {
-    beb: BestEffort<M>,
+pub struct UniformReliable {}
+
+impl UniformReliable {
+    /// Create both ends of a `UniformReliable` broadcast primitive using the
+    /// given `System`.
+    pub fn with<M: Message + 'static>(
+        system: System,
+    ) -> (UniformReliableBroadcaster<M>, UniformReliableDeliverer<M>) {
+        let (beb_bcast, beb_deliver) = BestEffort::with::<M>(system);
+        let (msg_tx, msg_rx) = mpsc::channel(32);
+        let (error_tx, error_rx) = mpsc::channel(1);
+        let (deliver_tx, deliver_rx) = mpsc::channel(32);
+
+        AckTask::spawn(beb_deliver, beb_bcast, deliver_tx, msg_rx, error_tx);
+
+        (
+            UniformReliableBroadcaster::new(msg_tx, error_rx),
+            UniformReliableDeliverer::new(deliver_rx),
+        )
+    }
 }
 
-impl<M: Message + 'static> UniformReliable<M> {
-    /// Create a new `UniformReliableBroadcast` with the given besteffort
-    /// broadcast.
-    pub fn new(system: System<M>) -> Self {
-        let beb = BestEffort::from(system);
+pub struct UniformReliableBroadcaster<M: Message + 'static> {
+    msg_tx: mpsc::Sender<M>,
+    error_rx: mpsc::Receiver<BroadcastError>,
+}
 
-        Self { beb }
+impl<M: Message + 'static> UniformReliableBroadcaster<M> {
+    fn new(
+        msg_tx: mpsc::Sender<M>,
+        error_rx: mpsc::Receiver<BroadcastError>,
+    ) -> Self {
+        Self { msg_tx, error_rx }
     }
 }
 
 #[async_trait]
-impl<M: Message + Unpin> Broadcast<M> for UniformReliable<M> {
-    async fn broadcast(&mut self, message: &M) -> Result<(), ()> {
-        todo!()
-    }
-
-    async fn incoming(
+impl<M: Message + 'static> Broadcaster<M> for UniformReliableBroadcaster<M> {
+    async fn broadcast(
         &mut self,
-    ) -> Box<dyn Stream<Item = (PublicKey, M)> + Send + Unpin> {
-        let peer_source = self
-            .beb
-            .system()
-            .peer_source()
-            .filter_map(|x| async { x.ok() })
-            .boxed();
-        let messages = self.beb.incoming().await;
-        let initial = self
-            .beb
-            .system()
-            .connections()
-            .await
-            .into_iter()
-            .map(|x| *x.public());
-
-        Box::new(Acker::new(peer_source, messages, initial))
+        message: &M,
+    ) -> Option<Vec<(PublicKey, SendError)>> {
+        if self.msg_tx.send(message.clone()).await.is_err() {
+            None
+        } else {
+            self.error_rx.recv().await.unwrap_or(None)
+        }
     }
 }
 
-struct Acker<M, S, P>
-where
-    Self: Unpin,
-    M: Message + 'static,
-    S: Stream<Item = (PublicKey, M)>,
-    P: Stream<Item = ConnectionManager<M>> + Send,
-{
-    messages: HashMap<M, HashSet<PublicKey>>,
-    peer_source: P,
-    peers: HashSet<PublicKey>,
-    incoming: S,
+pub struct UniformReliableDeliverer<M: Message + 'static> {
+    msg_rx: mpsc::Receiver<(PublicKey, M)>,
 }
 
-impl<M, S, P> Acker<M, S, P>
+impl<M: Message + 'static> UniformReliableDeliverer<M> {
+    fn new(msg_rx: mpsc::Receiver<(PublicKey, M)>) -> Self {
+        Self { msg_rx }
+    }
+}
+
+#[async_trait]
+impl<M: Message + 'static> Deliverer<M> for UniformReliableDeliverer<M> {
+    async fn deliver(&mut self) -> Option<(PublicKey, M)> {
+        self.msg_rx.recv().await
+    }
+}
+
+struct AckTask<B, D, M>
 where
-    M: Message + Unpin,
-    S: Stream<Item = (PublicKey, M)> + Send + Unpin,
-    P: Stream<Item = ConnectionManager<M>> + Send + Unpin,
+    B: Broadcaster<M> + 'static,
+    D: Deliverer<M> + 'static,
+    M: Message + 'static,
 {
-    fn new<I: Iterator<Item = PublicKey>>(
-        peer_source: P,
-        incoming: S,
-        initial: I,
-    ) -> Self {
-        Self {
-            peer_source,
+    incoming: D,
+    outgoing: B,
+    msg_tx: mpsc::Sender<(PublicKey, M)>,
+    msg_rx: mpsc::Receiver<M>,
+    error_tx: mpsc::Sender<BroadcastError>,
+    pending: HashMap<M, HashSet<PublicKey>>,
+}
+
+impl<B, D, M> AckTask<B, D, M>
+where
+    B: Broadcaster<M> + 'static,
+    D: Deliverer<M> + 'static,
+    M: Message + 'static,
+{
+    fn spawn(
+        incoming: D,
+        outgoing: B,
+        msg_tx: mpsc::Sender<(PublicKey, M)>,
+        msg_rx: mpsc::Receiver<M>,
+        error_tx: mpsc::Sender<BroadcastError>,
+    ) -> JoinHandle<D> {
+        let task = Self {
             incoming,
-            peers: initial.collect(),
-            messages: Default::default(),
-        }
+            outgoing,
+            msg_tx,
+            error_tx,
+            msg_rx,
+            pending: HashMap::default(),
+        };
+
+        task.task()
     }
 
     fn can_deliver(&mut self, pkey: &PublicKey, message: &M) -> bool {
-        match self.messages.entry(*message) {
-            Entry::Occupied(mut e) => {
-                let acks = e.get_mut();
-                acks.insert(*pkey);
-
-                self.peers.difference(acks).count() == 0
-            }
+        match self.pending.entry(message.clone()) {
+            Entry::Occupied(e) => todo!(),
             Entry::Vacant(e) => {
                 let mut new_acks = HashSet::default();
                 new_acks.insert(*pkey);
@@ -107,53 +135,18 @@ where
         }
     }
 
-    fn update_peer_list(&mut self, conn: &ConnectionManager<M>) {
-        self.peers.insert(*conn.public());
-    }
-
-    fn process_message(
-        mut self: Pin<&mut Self>,
-        data: Option<(PublicKey, M)>,
-        cx: &mut Context,
-    ) -> Poll<Option<<Self as Stream>::Item>> {
-        match data {
-            Some((ref pkey, ref message)) => {
-                if self.as_mut().can_deliver(pkey, message) {
-                    Poll::Ready(Some((*pkey, *message)))
-                } else {
-                    self.poll_next(cx)
+    fn task(mut self) -> JoinHandle<D> {
+        task::spawn(async move {
+            loop {
+                match self.incoming.deliver().await {
+                    None => return self.incoming,
+                    Some((ref pkey, ref msg)) => {
+                        if self.can_deliver(pkey, msg) {
+                            todo!()
+                        }
+                    }
                 }
             }
-            _ => Poll::Ready(None),
-        }
-    }
-
-    fn process_peer(&mut self, data: Option<ConnectionManager<M>>) {
-        if let Some(ref connection) = data {
-            self.update_peer_list(connection);
-        }
-    }
-}
-
-impl<M, S, P> Stream for Acker<M, S, P>
-where
-    M: Message + Unpin,
-    S: Stream<Item = (PublicKey, M)> + Send + Unpin,
-    P: Stream<Item = ConnectionManager<M>> + Send + Unpin,
-{
-    type Item = (PublicKey, M);
-
-    fn poll_next(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context,
-    ) -> Poll<Option<Self::Item>> {
-        while let Poll::Ready(peer) = self.peer_source.poll_next_unpin(cx) {
-            self.as_mut().process_peer(peer);
-        }
-
-        match self.incoming.poll_next_unpin(cx) {
-            Poll::Ready(message) => self.process_message(message, cx),
-            e => e,
-        }
+        })
     }
 }
