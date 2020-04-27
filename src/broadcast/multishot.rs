@@ -164,7 +164,7 @@ impl<M: Message + 'static> BroadcastTask<M> {
 
 #[cfg(test)]
 mod test {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use super::*;
     use crate::test::*;
@@ -174,6 +174,7 @@ mod test {
     use drop::net::TcpConnector;
 
     static DATA: AtomicUsize = AtomicUsize::new(0);
+    const VALUE: usize = 300;
 
     #[tokio::test]
     async fn single_message() {
@@ -253,5 +254,31 @@ mod test {
         );
 
         handle.await.expect("system failure");
+    }
+
+    #[tokio::test]
+    async fn rebroadcast() {
+        static SHOULD_SEND: AtomicBool = AtomicBool::new(false);
+
+        let (_, handle, system) =
+            create_system(10, |mut connection| async move {
+                if SHOULD_SEND.compare_and_swap(false, true, Ordering::AcqRel) {
+                    connection.send(&VALUE).await.expect("send failed");
+                }
+
+                let value =
+                    connection.receive::<usize>().await.expect("recv failed");
+
+                assert_eq!(VALUE, value, "wrong value received");
+            })
+            .await;
+
+        let (_, mut deliverer) = ReliableMultiShot::with::<usize>(system);
+
+        let (_, value) = deliverer.deliver().await.expect("no messages");
+
+        assert_eq!(value, VALUE, "wrong value delivered");
+
+        handle.await.expect("panic");
     }
 }
