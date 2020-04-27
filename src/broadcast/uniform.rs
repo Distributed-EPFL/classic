@@ -69,6 +69,7 @@ impl<M: Message + 'static> Broadcaster<M> for UniformReliableBroadcaster<M> {
     }
 }
 
+/// The delivery end of the `UniformReliable` broadcast primitive.
 pub struct UniformReliableDeliverer<M: Message + 'static> {
     msg_rx: mpsc::Receiver<(PublicKey, M)>,
 }
@@ -127,7 +128,13 @@ where
 
     fn can_deliver(&mut self, pkey: &PublicKey, message: &M) -> bool {
         match self.pending.entry(message.clone()) {
-            Entry::Occupied(_) => todo!(),
+            Entry::Occupied(mut e) => {
+                if e.get_mut().insert(*pkey) {
+                    todo!("check if all acks are  here")
+                } else {
+                    false
+                }
+            }
             Entry::Vacant(e) => {
                 let mut new_acks = HashSet::default();
                 new_acks.insert(*pkey);
@@ -153,10 +160,12 @@ where
                         let result = self.outgoing.broadcast(msg).await;
                         if self.error_tx.send(result).await.is_err() {
                             warn!("broadcaster has been dropped");
-                            break;
                         }
                     }
-                    Either::Right(None) => todo!(),
+                    Either::Right(None) => {
+                        warn!("no more peers available in system");
+                        break;
+                    }
                     Either::Left(Some((pkey, msg))) => {
                         if self.can_deliver(&pkey, &msg)
                             && self.msg_tx.send((pkey, msg)).await.is_err()
@@ -174,5 +183,54 @@ where
 
             (self.outgoing, self.incoming)
         })
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use crate::test::*;
+
+    const VALUE: usize = 10;
+
+    #[tokio::test]
+    async fn single_message_broadcast() {
+        init_logger();
+
+        let (_, handle, system) =
+            create_system(10, |mut connection| async move {
+                let value =
+                    connection.receive::<usize>().await.expect("recv failed");
+
+                assert_eq!(value, VALUE, "wrong value broadcasted");
+            })
+            .await;
+
+        let (mut bcast, _) = UniformReliable::with::<usize>(system);
+
+        let errors = bcast.broadcast(&VALUE).await.expect("broadcast failed");
+
+        assert!(errors.is_empty(), "some peers failed to receive");
+
+        handle.await.expect("failure");
+    }
+
+    #[tokio::test]
+    async fn single_message_delivery() {
+        init_logger();
+
+        let (_, handle, system) =
+            create_system(50, |mut connection| async move {
+                connection.send(&VALUE).await.expect("send failed");
+            })
+            .await;
+
+        let (_, mut delivery) = UniformReliable::with::<usize>(system);
+
+        let (_, value) = delivery.deliver().await.expect("no messages");
+
+        assert_eq!(value, VALUE, "wrong value delivered");
+
+        handle.await.expect("panic");
     }
 }
