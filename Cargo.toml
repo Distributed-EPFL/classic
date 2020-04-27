@@ -8,13 +8,13 @@ edition = "2018"
 
 [dependencies]
 drop = { git = "https://github.com/Distributed-EPFL/drop", branch = "feature/io" }
-futures = "0.3.4"
-tokio = "0.2.0"
-tracing = "0.1.13"
-serde = "1.0.102"
-hashbrown = "0.7.0"
-tracing-futures = "0.2.3"
-error-chain = "0.12.2"
+futures = "~0.3"
+tokio = "~0.2"
+tracing = "~0.1"
+serde = "~1.0"
+hashbrown = "~0.7"
+tracing-futures = "~0.2"
+error-chain = "~0.12"
 
 [dev-dependencies]
 tracing-subscriber = "*"
