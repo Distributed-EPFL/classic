@@ -24,15 +24,15 @@ pub struct ReliableMultiShot {}
 impl ReliableMultiShot {
     /// Create a new `ReliableMultiShot` that will use the given
     /// `System` to broadcast `Message`s
-    pub fn with<M: Message + 'static>(
-        system: System,
+    pub fn with<M: Message + 'static, S: System>(
+        system: S,
     ) -> (
         ReliableMultiShotBroadcaster<M>,
         ReliableMultiShotDeliverer<M>,
     ) {
         let (bcast_tx, bcast_rx) = mpsc::channel(32);
         let (rb_tx, rb_rx) = mpsc::channel(32);
-        let (broadcaster, deliverer) = BestEffort::with::<M>(system);
+        let (broadcaster, deliverer) = BestEffort::with::<M, _>(system);
         let (err_rx, _) = BroadcastTask::spawn(broadcaster, bcast_rx, rb_rx);
         let broadcaster = ReliableMultiShotBroadcaster::new(bcast_tx, err_rx);
         let receiver = ReliableMultiShotDeliverer::new(deliverer, rb_tx);
@@ -168,7 +168,7 @@ mod test {
 
     use super::*;
     use crate::test::*;
-    use crate::System;
+    use crate::Basic;
 
     use drop::crypto::key::exchange::Exchanger;
     use drop::net::TcpConnector;
@@ -207,7 +207,7 @@ mod test {
         .await;
         let pkeys = public.iter().map(|x| x.0);
         let connector = TcpConnector::new(Exchanger::random());
-        let system = System::new_with_connector(
+        let system = Basic::new_with_connector(
             &connector,
             pkeys,
             addrs.drain(..).map(|x| x.1),
@@ -273,7 +273,7 @@ mod test {
             })
             .await;
 
-        let (_, mut deliverer) = ReliableMultiShot::with::<usize>(system);
+        let (_, mut deliverer) = ReliableMultiShot::with::<usize, _>(system);
 
         let (_, value) = deliverer.deliver().await.expect("no messages");
 

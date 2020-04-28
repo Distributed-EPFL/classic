@@ -3,7 +3,7 @@ use std::future::Future;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicU16, Ordering};
 
-use crate::System;
+use crate::Basic;
 
 use drop::crypto::key::exchange::{Exchanger, PublicKey};
 use drop::net::{Connection, Listener, TcpConnector, TcpListener};
@@ -79,7 +79,7 @@ pub async fn create_system<
 >(
     size: usize,
     closure: C,
-) -> (Vec<(PublicKey, SocketAddr)>, JoinHandle<()>, System) {
+) -> (Vec<(PublicKey, SocketAddr)>, JoinHandle<()>, Basic) {
     init_logger();
     let tcp = TcpConnector::new(Exchanger::random());
     let mut addrs = test_addrs(size);
@@ -103,6 +103,6 @@ pub async fn create_system<
     (
         output.clone(),
         handle,
-        System::new_with_connector_zipped(&tcp, output).await,
+        Basic::new_with_connector_zipped(&tcp, output).await,
     )
 }

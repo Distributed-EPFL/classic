@@ -1,3 +1,5 @@
+//! This module contains broadcast primitives.
+
 use std::future::Future;
 use std::marker::PhantomData;
 use std::pin::Pin;

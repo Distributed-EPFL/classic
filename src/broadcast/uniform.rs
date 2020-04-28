@@ -24,10 +24,10 @@ pub struct UniformReliable {}
 impl UniformReliable {
     /// Create both ends of a `UniformReliable` broadcast primitive using the
     /// given `System`.
-    pub fn with<M: Message + 'static>(
-        system: System,
+    pub fn with<M: Message + 'static, S: System>(
+        system: S,
     ) -> (UniformReliableBroadcaster<M>, UniformReliableDeliverer<M>) {
-        let (beb_bcast, beb_deliver) = BestEffort::with::<M>(system);
+        let (beb_bcast, beb_deliver) = BestEffort::with::<M, _>(system);
         let (msg_tx, msg_rx) = mpsc::channel(32);
         let (error_tx, error_rx) = mpsc::channel(1);
         let (deliver_tx, deliver_rx) = mpsc::channel(32);
@@ -206,7 +206,7 @@ mod test {
             })
             .await;
 
-        let (mut bcast, _) = UniformReliable::with::<usize>(system);
+        let (mut bcast, _) = UniformReliable::with::<usize, _>(system);
 
         let errors = bcast.broadcast(&VALUE).await.expect("broadcast failed");
 
@@ -225,7 +225,7 @@ mod test {
             })
             .await;
 
-        let (_, mut delivery) = UniformReliable::with::<usize>(system);
+        let (_, mut delivery) = UniformReliable::with::<usize, _>(system);
 
         let (_, value) = delivery.deliver().await.expect("no messages");
 

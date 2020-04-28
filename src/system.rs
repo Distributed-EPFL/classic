@@ -2,12 +2,14 @@ use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
 use std::net::Ipv4Addr;
+use std::pin::Pin;
+use std::sync::Arc;
 
 use drop::crypto::key::exchange::PublicKey;
 use drop::net::{ConnectError, Connection, Connector, Listener, ListenerError};
 
 use futures::future;
-use futures::stream::{select_all, Stream};
+use futures::stream::{select_all, Stream, StreamExt};
 
 use tokio::sync::mpsc;
 use tokio::task::{self, JoinHandle};
@@ -15,16 +17,28 @@ use tokio::task::{self, JoinHandle};
 use tracing::{debug_span, error, info, warn};
 use tracing_futures::Instrument;
 
+/// Types that can be turned into a `System`
+pub trait System {
+    /// Get all the `Connection`s known to this `System`.
+    /// The returned `Connection`s will be removed from the system.
+    fn connections(&mut self) -> Vec<Connection>;
+
+    /// Get a `Stream` that will produce incoming `Connection`s to the
+    /// `System`. The exact behavior will depend on which `System` is used.
+    fn peer_source(&mut self)
+        -> Pin<Box<dyn Stream<Item = Connection> + Send>>;
+}
+
 /// A representation of a distributed `System` that manages connections to and
 /// from other peers.
-pub struct System {
+pub struct Basic {
     connections: HashMap<PublicKey, Connection>,
     listeners: Vec<JoinHandle<Result<(), ListenerError>>>,
     _listener_handles: Vec<JoinHandle<Result<(), ListenerError>>>,
     peer_input: Vec<mpsc::Receiver<Connection>>,
 }
 
-impl System {
+impl Basic {
     /// Create a new `System` using an `Iterator` over pairs of `PublicKey`s and
     /// `Connection` `Future`s
     pub async fn new<
@@ -192,29 +206,86 @@ impl System {
 
         err_rx
     }
+}
 
-    /// Get all the `Connection`s known to this `System`.
-    /// The returned `Connection`s will be removed from the system.
-    pub fn connections(&mut self) -> Vec<Connection> {
-        self.connections.drain().map(|x| x.1).collect()
-    }
-
+impl System for Basic {
     /// Get a `Stream` that produces incoming `Connection`s from all registered
     /// `Listener`s. Subsequent calls to this method will only produces peers
     /// from `Listener`s that have been added *after* the previous call.
-    pub fn peer_source(&mut self) -> impl Stream<Item = Connection> {
-        select_all(self.peer_input.drain(..))
+    fn peer_source(
+        &mut self,
+    ) -> Pin<Box<dyn Stream<Item = Connection> + Send>> {
+        select_all(self.peer_input.drain(..)).boxed()
+    }
+
+    fn connections(&mut self) -> Vec<Connection> {
+        self.connections.drain().map(|x| x.1).collect()
     }
 }
 
-impl Default for System {
+impl Default for Basic {
     fn default() -> Self {
-        Self {
+        Basic {
             connections: Default::default(),
             listeners: Default::default(),
             _listener_handles: Vec::new(),
             peer_input: Vec::new(),
         }
+    }
+}
+
+/// A permissioned `System` that places restrictions on which peers can join the
+/// `System`
+pub struct Permissioned<F>
+where
+    F: Fn(Connection) -> Option<Connection> + Send + Sync,
+{
+    /// Use this to add peers to the `System`
+    pub system: Basic,
+    filter: Arc<F>,
+}
+
+impl<F> Permissioned<F>
+where
+    F: Fn(Connection) -> Option<Connection> + Send + Sync,
+{
+    /// Create a new `Permissioned` `System` that will filter connections
+    /// using the provided filter closure.
+    pub fn new(filter: F) -> Self {
+        Self {
+            system: Basic::default(),
+            filter: Arc::new(filter),
+        }
+    }
+}
+
+impl<F> System for Permissioned<F>
+where
+    F: Fn(Connection) -> Option<Connection> + Send + Sync + 'static,
+{
+    fn peer_source(
+        &mut self,
+    ) -> Pin<Box<dyn Stream<Item = Connection> + Send>> {
+        let filter = self.filter.clone();
+
+        self.system
+            .peer_source()
+            .filter_map(move |x| {
+                let filter = filter.clone();
+
+                async move { filter(x) }
+            })
+            .boxed()
+    }
+
+    fn connections(&mut self) -> Vec<Connection> {
+        let filter = self.filter.clone();
+
+        self.system
+            .connections()
+            .drain(..)
+            .filter_map(move |x| (filter)(x))
+            .collect()
     }
 }
 
@@ -247,7 +318,7 @@ mod test {
                 assert_eq!(data, 0, "wrong data received");
             })
             .await;
-        let mut system: System = Default::default();
+        let mut system: Basic = Default::default();
         let connector = TcpConnector::new(Exchanger::random());
         let errors = system.add_peers(&connector, &candidates).await;
 
@@ -267,7 +338,7 @@ mod test {
 
     #[tokio::test]
     async fn add_listener() {
-        let mut system = System::default();
+        let mut system = Basic::default();
         let (exchanger, addr) = test_addrs(1).pop().unwrap();
         let pkey = *exchanger.keypair().public();
 

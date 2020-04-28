@@ -32,9 +32,13 @@ pub struct BestEffort {}
 
 impl BestEffort {
     /// Create a new `BestEffort` broadcast that will use the given `System`
-    pub fn with<M: Message + 'static>(
-        mut system: System,
-    ) -> (BestEffortBroadcaster, BestEffortReceiver<M>) {
+    pub fn with<M, S>(
+        mut system: S,
+    ) -> (BestEffortBroadcaster, BestEffortReceiver<M>)
+    where
+        M: Message + 'static,
+        S: System,
+    {
         let (readers, writers): (Vec<_>, Vec<_>) = system
             .connections()
             .drain(..)
@@ -224,11 +228,12 @@ impl<M: Message + 'static> Stream for MessageStream<M> {
 
 #[cfg(test)]
 mod test {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
     use crate::broadcast::Broadcaster;
+    use crate::system::Basic;
     use crate::test::*;
-    use crate::System;
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use drop::crypto::key::exchange::Exchanger;
     use drop::net::TcpConnector;
@@ -258,9 +263,9 @@ mod test {
         let handles = public.drain(..).map(|x| x.1);
         let candidates = pkeys.into_iter().zip(addrs.drain(..).map(|x| x.1));
 
-        let system: System =
-            System::new_with_connector_zipped(&tcp, candidates).await;
-        let (mut sender, _) = BestEffort::with::<usize>(system);
+        let system: Basic =
+            Basic::new_with_connector_zipped(&tcp, candidates).await;
+        let (mut sender, _) = BestEffort::with::<usize, _>(system);
 
         let errors = sender.broadcast(&0usize).await;
 
@@ -297,10 +302,10 @@ mod test {
         let handles = public.drain(..).map(|x| x.1);
         let candidates = pkeys.into_iter().zip(addrs.drain(..).map(|x| x.1));
 
-        let system: System =
-            System::new_with_connector_zipped(&tcp, candidates).await;
+        let system: Basic =
+            Basic::new_with_connector_zipped(&tcp, candidates).await;
 
-        let (_, mut receiver) = BestEffort::with::<usize>(system);
+        let (_, mut receiver) = BestEffort::with::<usize, _>(system);
 
         for _ in 0..10usize {
             let (_, data) = receiver.deliver().await.expect("early eof");
