@@ -1,23 +1,19 @@
-use std::future::Future;
-use std::pin::Pin;
-use std::task::{Context, Poll};
+use std::collections::HashSet;
 
-use super::{Broadcaster, Deliverer};
+use super::{Broadcaster, Deliverer, MessageStream};
 use crate::{Message, System};
 
 use drop::async_trait;
 use drop::crypto::key::exchange::PublicKey;
-use drop::net::{
-    Connection, ConnectionRead, ConnectionWrite, ReceiveError, SendError,
-};
+use drop::net::{Connection, ConnectionRead, ConnectionWrite, SendError};
 
-use futures::future::{self, FutureExt};
-use futures::stream::{self, SelectAll, Stream, StreamExt};
+use futures::future;
+use futures::stream::{self, SelectAll, StreamExt};
 
 use tokio::sync::mpsc;
 use tokio::task;
 
-use tracing::{debug_span, error, info, warn};
+use tracing::{debug_span, info, warn};
 use tracing_futures::Instrument;
 
 fn poll_peers<T>(receiver: &mut mpsc::Receiver<T>, dest: &mut Vec<T>) {
@@ -139,9 +135,11 @@ impl<M: Message> Broadcaster<M> for BestEffortBroadcaster {
 
         Some(errors)
     }
-}
 
-type ReceiverResult<M> = Result<(M, ConnectionRead), (PublicKey, ReceiveError)>;
+    fn known_peers(&self) -> HashSet<PublicKey> {
+        self.connections.iter().map(|x| *x.remote_pkey()).collect()
+    }
+}
 
 /// The receiving end of the `BestEffort` broadcast primitive
 pub struct BestEffortReceiver<M: Message + 'static> {
@@ -169,56 +167,11 @@ impl<M: Message + 'static> BestEffortReceiver<M> {
 impl<M: Message + 'static> Deliverer<M> for BestEffortReceiver<M> {
     async fn deliver(&mut self) -> Option<(PublicKey, M)> {
         while let Ok(connection) = self.peer_source.try_recv() {
-            self.connections.push(MessageStream::new(connection));
+            let stream = MessageStream::new(connection);
+            self.connections.push(stream);
         }
 
         self.connections.next().await
-    }
-}
-
-struct MessageStream<M: Message + 'static> {
-    future: Pin<Box<dyn Future<Output = ReceiverResult<M>> + Send>>,
-}
-
-impl<M: Message + 'static> MessageStream<M> {
-    fn new(connection: ConnectionRead) -> Self {
-        Self {
-            future: Self::future_from_read(connection),
-        }
-    }
-
-    fn future_from_read(
-        mut connection: ConnectionRead,
-    ) -> Pin<Box<dyn Future<Output = ReceiverResult<M>> + Send>> {
-        async move {
-            match connection.receive::<M>().await {
-                Ok(message) => Ok((message, connection)),
-                Err(e) => Err((*connection.remote_pkey(), e)),
-            }
-        }
-        .boxed()
-    }
-}
-
-impl<M: Message + 'static> Stream for MessageStream<M> {
-    type Item = (PublicKey, M);
-
-    fn poll_next(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context,
-    ) -> Poll<Option<(PublicKey, M)>> {
-        match self.future.poll_unpin(cx) {
-            Poll::Ready(Ok((message, connection))) => {
-                let pkey = *connection.remote_pkey();
-                self.future = Self::future_from_read(connection);
-                Poll::Ready(Some((pkey, message)))
-            }
-            Poll::Ready(Err((pkey, err))) => {
-                error!("error receiving message from {}: {}", pkey, err);
-                Poll::Ready(None)
-            }
-            Poll::Pending => Poll::Pending,
-        }
     }
 }
 

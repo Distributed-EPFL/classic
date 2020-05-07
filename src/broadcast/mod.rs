@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::future::Future;
 use std::marker::PhantomData;
 use std::pin::Pin;
@@ -7,7 +8,7 @@ use super::Message;
 
 use drop::async_trait;
 use drop::crypto::key::exchange::PublicKey;
-use drop::net::SendError;
+use drop::net::{ConnectionRead, ReceiveError, SendError};
 
 use futures::future::{Fuse, FusedFuture, FutureExt};
 use futures::sink::Sink;
@@ -16,7 +17,7 @@ use futures::stream::{self, Stream, StreamExt};
 use tokio::sync::broadcast;
 use tokio::task;
 
-use tracing::{debug_span, warn};
+use tracing::{debug_span, error, warn};
 use tracing_futures::Instrument;
 
 mod besteffort;
@@ -52,6 +53,10 @@ pub trait Broadcaster<M: Message>: Send {
         &mut self,
         message: &M,
     ) -> Option<Vec<(PublicKey, SendError)>>;
+
+    /// Returns a `HashSet` of all `PublicKey` currently known by this
+    /// `Broadcaster`;
+    fn known_peers(&self) -> HashSet<PublicKey>;
 
     /// Transform this `Broadcaster` into a `Sink` that can be used with the
     /// adpaters from  the `futures` crate. `Message`s consumed by the `Sink`
@@ -258,6 +263,57 @@ impl<D: Deliverer<M>, M: Message + 'static> Deliverer<M> for Duplicator<D, M> {
     }
 }
 
+type ReceiverResult<M> = Result<(M, ConnectionRead), (PublicKey, ReceiveError)>;
+
+/// A wrapper that allows a `ConnectionRead` to be turned into a `Stream` of
+/// `Message`s
+pub struct MessageStream<M: Message + 'static> {
+    future: Pin<Box<dyn Future<Output = ReceiverResult<M>> + Send>>,
+}
+
+impl<M: Message + 'static> MessageStream<M> {
+    /// Create a new `Stream` of `Message` from the given `ConnectionRead`
+    pub fn new(connection: ConnectionRead) -> Self {
+        Self {
+            future: Self::future_from_read(connection),
+        }
+    }
+
+    fn future_from_read(
+        mut connection: ConnectionRead,
+    ) -> Pin<Box<dyn Future<Output = ReceiverResult<M>> + Send>> {
+        async move {
+            match connection.receive::<M>().await {
+                Ok(message) => Ok((message, connection)),
+                Err(e) => Err((*connection.remote_pkey(), e)),
+            }
+        }
+        .boxed()
+    }
+}
+
+impl<M: Message + 'static> Stream for MessageStream<M> {
+    type Item = (PublicKey, M);
+
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context,
+    ) -> Poll<Option<(PublicKey, M)>> {
+        match self.future.poll_unpin(cx) {
+            Poll::Ready(Ok((message, connection))) => {
+                let pkey = *connection.remote_pkey();
+                self.future = Self::future_from_read(connection);
+                Poll::Ready(Some((pkey, message)))
+            }
+            Poll::Ready(Err((pkey, err))) => {
+                error!("error receiving message from {}: {}", pkey, err);
+                Poll::Ready(None)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -297,6 +353,10 @@ mod test {
             message: &M,
         ) -> Option<Vec<(PublicKey, SendError)>> {
             (self.closure)(message)
+        }
+
+        fn known_peers(&self) -> HashSet<PublicKey> {
+            panic!("unexpected call")
         }
     }
 
