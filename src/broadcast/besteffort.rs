@@ -93,11 +93,6 @@ impl BestEffortBroadcaster {
             peer_source,
         }
     }
-
-    /// Remove all broken `Connections` from this `Broadcaster`
-    pub fn purge(&mut self) {
-        self.connections.retain(|_| todo!());
-    }
 }
 
 #[async_trait]
@@ -188,8 +183,6 @@ mod test {
 
     use tracing::debug_span;
     use tracing_futures::Instrument;
-
-    impl Message for usize {}
 
     #[tokio::test]
     async fn single_shot() {
