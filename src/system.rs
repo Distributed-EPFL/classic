@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
 use std::net::Ipv4Addr;
+use std::sync::Arc;
 
 use drop::crypto::key::exchange::PublicKey;
 use drop::net::{ConnectError, Connection, Connector, Listener, ListenerError};
@@ -214,6 +215,18 @@ impl Default for System {
             listeners: Default::default(),
             _listener_handles: Vec::new(),
             peer_input: Vec::new(),
+        }
+    }
+}
+
+impl From<Vec<Connection>> for System {
+    fn from(connections: Vec<Connection>) -> Self {
+        Self {
+            connections: connections
+                .into_iter()
+                .map(|x| (x.remote_key().unwrap(), x))
+                .collect(),
+            ..Default::default()
         }
     }
 }
