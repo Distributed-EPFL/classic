@@ -6,44 +6,66 @@ use std::sync::Arc;
 use crate::Message;
 
 use drop::crypto::key::exchange::PublicKey;
-use drop::net::{ConnectionRead, ConnectionWrite, Connector};
+use drop::net::{
+    Connection, ConnectionRead, ConnectionWrite, Connector, Listener,
+};
 
 use futures::{Stream, StreamExt, TryStreamExt};
 
-use snafu::{OptionExt, Snafu};
+use snafu::{OptionExt, ResultExt, Snafu};
 
 use tokio::sync::{broadcast, mpsc, Mutex};
 use tokio::task::{self, JoinError, JoinHandle};
 
-use tracing::{debug, debug_span, error, warn};
+use tracing::{debug, debug_span, error, info, warn};
 use tracing_futures::Instrument;
 
-#[derive(Snafu, Debug, Clone)]
+#[derive(Snafu, Debug, Clone, Eq, PartialEq)]
 /// Error type for `Connection` related errors
 pub enum ConnectionError {
+    /// An error type returned when trying to send/receive on a closed
+    /// connection
     #[snafu(display("connection was closed"))]
     ConnectionClosed,
     #[snafu(display("handshake failed"))]
+    /// An error returned when attempting to create a handle with an
+    /// unauthenticated connection
     HandshakeFailed,
+    #[snafu(display("lost {} messages", count))]
+    /// An error returned when some number of messages were lost due to
+    /// too slow processing
+    Lagged {
+        /// The number of messages that were lost
+        count: u64,
+    },
     #[snafu(display("failed to establish connection"))]
+    /// Error returned when the connection failed to be established
     Connect,
     #[snafu(display("error sending"))]
+    /// Error when sending a message fails
     SendError,
     #[snafu(display("error receiving"))]
+    /// Error when receiving a message fails
     Receive,
     #[snafu(display("connection handler panicked"))]
+    /// Error when the connection handler panicked
     HandlerCrash,
     #[snafu(display("read wasn't ready and should be retried"))]
+    /// Error returned when a send or receive should be attempted again
     Again,
     #[snafu(display("connection was broken and needs a reconnect"))]
+    /// Error returned when a connection has been broken and needs to be
+    /// re-established
     Reconnect,
     #[snafu(display("fatal connection error"))]
+    /// Error returned when a connection encounters a fatal error
     Fatal,
 }
 
 /// Receiving task for `ConnectionHandle`
 struct ConnectionReceiver<M: Message> {
     sender: broadcast::Sender<Result<Arc<M>, ConnectionError>>,
+    notify: mpsc::Sender<()>,
     read: ConnectionRead,
 }
 
@@ -57,6 +79,7 @@ where
                 match self.read.receive().await {
                     Err(e) => {
                         error!("connection receiver error: {}", e);
+                        let _ = self.notify.send(()).await;
                         if self.sender.send(Reconnect.fail()).is_err() {
                             warn!("no more connection handle");
                         }
@@ -78,6 +101,7 @@ where
 
 struct ConnectionSender<M: Message> {
     receiver: mpsc::Receiver<M>,
+    notify: mpsc::Receiver<()>,
     write: ConnectionWrite,
 }
 
@@ -88,14 +112,23 @@ where
     fn task(mut self) -> impl Future<Output = Self> {
         async move {
             loop {
-                match self.receiver.recv().await {
-                    Some(ref message) => {
-                        if let Err(e) = self.write.send(message).await {
-                            error!("writing message failed: {}", e);
-                            break;
+                tokio::select! {
+                    result = self.receiver.recv() =>  {
+                        match result {
+                            Some(ref message) => {
+                                if let Err(e) = self.write.send(message).await {
+                                    error!("writing message failed: {}", e);
+                                    break;
+                                }
+                            }
+                            None => {
+                                break;
+                            }
                         }
                     }
-                    None => {
+
+                    _ = self.notify.recv() => {
+                        debug!("stopping send loop after receive error");
                         break;
                     }
                 }
@@ -119,8 +152,8 @@ where
     receiver: broadcast::Receiver<Result<Arc<M>, ConnectionError>>,
     sender: mpsc::Sender<M>,
     pkey: Arc<PublicKey>,
-    connector: Arc<C>,
-    candidate: Arc<A>,
+    connector: Option<Arc<C>>,
+    candidate: Option<Arc<A>>,
     receive_handle: SharedJoinHandle<ConnectionReceiver<M>>,
     send_handle: SharedJoinHandle<ConnectionSender<M>>,
 }
@@ -144,6 +177,31 @@ where
             })?;
         let connector = Arc::new(connector);
         let candidate = Arc::new(candidate);
+
+        Self::setup(connection, pkey, Some(connector), Some(candidate))
+    }
+
+    /// Create a new `ConnectionHandle` for an incoming `Connection` using the
+    /// provided `Listener`
+    pub async fn accept<L: Listener<Candidate = A>>(
+        listener: &mut L,
+    ) -> Result<Self, ConnectionError> {
+        let connection = listener.accept().await.map_err(|e| {
+            error!("failed to accept connection: {}", e);
+            Connect.build()
+        })?;
+
+        let pkey = connection.remote_key().context(HandshakeFailed)?;
+
+        Self::setup(connection, pkey, None, None)
+    }
+
+    fn setup(
+        connection: Connection,
+        pkey: PublicKey,
+        connector: Option<Arc<C>>,
+        candidate: Option<Arc<A>>,
+    ) -> Result<Self, ConnectionError> {
         let pkey = Arc::new(pkey);
 
         let (recv_tx, recv_rx) = broadcast::channel(32);
@@ -151,13 +209,17 @@ where
 
         let (read, write) = connection.split().context(HandshakeFailed)?;
 
+        let (stop_tx, stop_rx) = mpsc::channel(1);
+
         let sender = ConnectionSender {
             receiver: send_rx,
+            notify: stop_rx,
             write,
         };
 
         let receiver = ConnectionReceiver {
             sender: recv_tx.clone(),
+            notify: stop_tx,
             read,
         };
 
@@ -189,6 +251,21 @@ where
     /// `Connection` is broken and needs a reconnection.
     /// If the reconnection fails all handles to this `Connection` will fail.
     pub async fn reconnect(&mut self) -> Result<(), ConnectionError> {
+        match (self.connector.as_ref(), self.candidate.as_ref()) {
+            (Some(_), Some(_)) => self.reconnect_internal().await,
+            (_, _) => {
+                error!("can't reconnect an incoming connection");
+                ConnectionClosed.fail()
+            }
+        }
+    }
+
+    async fn reconnect_internal(&mut self) -> Result<(), ConnectionError> {
+        let connector = self.connector.as_ref().unwrap();
+        let candidate = self.candidate.as_ref().unwrap();
+
+        info!("attempting reconnection to {}", candidate);
+
         let receiver = self.receive_handle.try_join().await;
         let sender = self.send_handle.try_join().await;
 
@@ -202,11 +279,16 @@ where
             (Some(Ok(receiver)), Some(Ok(sender))) => (receiver, sender),
         };
 
-        let connection = self
-            .connector
-            .connect(&self.pkey, &self.candidate)
+        debug!("handler are finished, reconnecting to {}", candidate);
+
+        let connection = connector
+            .connect(&self.pkey, &candidate)
             .await
-            .unwrap();
+            .map_err(|_| {
+                error!("error reconnecting to {}", candidate);
+                snafu::NoneError
+            })
+            .context(Connect)?;
 
         let (read, write) = connection.split().context(HandshakeFailed)?;
 
@@ -216,7 +298,7 @@ where
         let send_handle = task::spawn(
             sender
                 .task()
-                .instrument(debug_span!("receiver", remote = %self.pkey)),
+                .instrument(debug_span!("sender", remote = %self.pkey)),
         );
 
         let receive_handle = task::spawn(
@@ -237,6 +319,10 @@ where
     ) -> impl Stream<Item = Result<Arc<M>, ConnectionError>> {
         self.bcast.subscribe().into_stream().map(|x| match x {
             Ok(m) => m,
+            Err(broadcast::RecvError::Lagged(count)) => {
+                warn!("running too slow, {} messages were lost", count);
+                Lagged { count }.fail()
+            }
             Err(_) => ConnectionClosed.fail(),
         })
     }
@@ -345,8 +431,7 @@ mod test {
 
     use tokio::sync::oneshot;
 
-    #[tokio::test]
-    async fn simple_message() {
+    async fn test_setup() -> (SocketAddr, PublicKey, Exchanger, TcpListener) {
         init_logger();
 
         let addr: SocketAddr = (Ipv4Addr::LOCALHOST, 0).into();
@@ -354,11 +439,18 @@ mod test {
         let server_key = *server_keypair.keypair().public();
         let client_keypair = Exchanger::random();
 
-        let mut listener = TcpListener::new(addr, server_keypair)
+        let listener = TcpListener::new(addr, server_keypair)
             .await
-            .expect("failed to listen");
+            .expect("listen failed");
+        let addr = listener.local_addr().expect("no address");
 
-        let addr = listener.local_addr().expect("no listener addr");
+        (addr, server_key, client_keypair, listener)
+    }
+
+    #[tokio::test]
+    async fn simple_message() {
+        let (addr, server_key, client_keypair, mut listener) =
+            test_setup().await;
 
         let t = task::spawn(async move {
             let mut connection =
@@ -384,17 +476,8 @@ mod test {
 
     #[tokio::test]
     async fn cloned_handle() {
-        init_logger();
-
-        let addr: SocketAddr = (Ipv4Addr::LOCALHOST, 0).into();
-        let server_keypair = Exchanger::random();
-        let server_key = *server_keypair.keypair().public();
-        let client_keypair = Exchanger::random();
-
-        let mut listener = TcpListener::new(addr, server_keypair)
-            .await
-            .expect("listen failed");
-        let addr = listener.local_addr().expect("no address");
+        let (addr, server_key, client_keypair, mut listener) =
+            test_setup().await;
 
         let (start_tx, start_rx) = oneshot::channel();
 
@@ -421,13 +504,7 @@ mod test {
         start_tx.send(()).expect("start failed");
 
         future::join_all(connections.into_iter().map(|mut c| async move {
-            loop {
-                match c.receive().await {
-                    Err(ConnectionError::Again) => continue,
-                    Err(e) => panic!("receive failed {}", e),
-                    Ok(msg) => return msg,
-                }
-            }
+            c.receive().await.expect("recv failed")
         }))
         .await
         .into_iter()
@@ -438,6 +515,79 @@ mod test {
 
     #[tokio::test]
     async fn closed_connection_receive() {
-        todo!()
+        let (addr, server_key, client_keypair, mut listener) =
+            test_setup().await;
+
+        let handle = task::spawn(async move {
+            listener.accept().await.expect("accept failed");
+        });
+
+        let mut connection = ConnectionHandle::<usize, _, _>::connect(
+            TcpConnector::new(client_keypair),
+            addr,
+            server_key,
+        )
+        .await
+        .expect("failed to connect");
+
+        connection
+            .receive()
+            .await
+            .expect_err("no error occurred on closed connection");
+
+        handle.await.expect("listener panicked");
+    }
+
+    #[tokio::test]
+    async fn reconnect() {
+        let (addr, server_key, client_keypair, mut listener) =
+            test_setup().await;
+
+        use tracing::info;
+
+        let handle = task::spawn(async move {
+            let mut connection =
+                listener.accept().await.expect("accept failed");
+
+            info!("accepted first connection");
+
+            connection.close().await.expect("close failed");
+
+            info!("closed first connection");
+
+            let mut connection =
+                listener.accept().await.expect("accept failed");
+
+            info!("accepted second connection");
+
+            connection.send(&0usize).await.expect("send failed");
+        });
+
+        let mut connection = ConnectionHandle::<usize, _, _>::connect(
+            TcpConnector::new(client_keypair),
+            addr,
+            server_key,
+        )
+        .await
+        .expect("connect failed");
+
+        let result = connection.receive().await;
+
+        assert!(result.is_err(), "success despite disconnect");
+        assert_eq!(
+            result.unwrap_err(),
+            ConnectionError::Reconnect,
+            "wrong error type returned"
+        );
+
+        connection.reconnect().await.expect("reconnect failed");
+
+        assert_eq!(
+            *connection.receive().await.expect("recv failed"),
+            0usize,
+            "wrong value received"
+        );
+
+        handle.await.expect("panic error");
     }
 }
