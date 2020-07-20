@@ -11,11 +11,12 @@ use drop::crypto::key::exchange::PublicKey;
 use drop::net::{ConnectionRead, ReceiveError, SendError};
 
 use futures::future::{Fuse, FusedFuture, FutureExt};
+use futures::pin_mut;
 use futures::sink::Sink;
 use futures::stream::{self, Stream, StreamExt};
 
-use tokio::sync::broadcast;
-use tokio::task;
+use tokio::sync::{broadcast, mpsc};
+use tokio::task::{self, JoinHandle};
 
 use tracing::{debug_span, error, warn};
 use tracing_futures::Instrument;
@@ -24,10 +25,16 @@ mod besteffort;
 pub use besteffort::{BestEffort, BestEffortBroadcaster, BestEffortReceiver};
 
 mod multishot;
-pub use multishot::ReliableMultiShot;
+pub use multishot::{
+    ReliableMultiShot, ReliableMultiShotBroadcaster, ReliableMultiShotDeliverer,
+};
 
 mod uniform;
-pub use uniform::UniformReliable;
+pub use uniform::{
+    UniformReliable, UniformReliableBroadcaster, UniformReliableDeliverer,
+};
+
+mod doubleecho;
 
 /// This is the error type returned by `Broadcaster::broadcast`.
 /// If this value is `None` the `Broadcaster` is not in an usable state anymore
@@ -55,7 +62,9 @@ pub trait Broadcaster<M: Message>: Send {
     ) -> Option<Vec<(PublicKey, SendError)>>;
 
     /// Returns a `HashSet` of all `PublicKey` currently known by this
-    /// `Broadcaster`;
+    /// `Broadcaster`. <br />
+    /// This should be change to `impl Iterator<Item = PublicKey>` if/when
+    /// use of impl Trait is made stable in trait fns
     fn known_peers(&self) -> HashSet<PublicKey>;
 
     /// Transform this `Broadcaster` into a `Sink` that can be used with the
@@ -311,6 +320,60 @@ impl<M: Message + 'static> Stream for MessageStream<M> {
             }
             Poll::Pending => Poll::Pending,
         }
+    }
+}
+
+pub(self) struct BroadcastTask<M: Message + 'static> {
+    rebroadcast: mpsc::Receiver<M>,
+    broadcast: mpsc::Receiver<M>,
+    errors: mpsc::Sender<Option<Vec<(PublicKey, SendError)>>>,
+    beb: BestEffortBroadcaster,
+}
+
+impl<M: Message + 'static> BroadcastTask<M> {
+    fn spawn(
+        beb: BestEffortBroadcaster,
+        broadcast: mpsc::Receiver<M>,
+        rebroadcast: mpsc::Receiver<M>,
+    ) -> (
+        mpsc::Receiver<BroadcastError>,
+        JoinHandle<BestEffortBroadcaster>,
+    ) {
+        let (errors, errors_rx) = mpsc::channel(1);
+
+        let handle = Self {
+            beb,
+            broadcast,
+            rebroadcast,
+            errors,
+        }
+        .task();
+
+        (errors_rx, handle)
+    }
+
+    fn task(mut self) -> JoinHandle<BestEffortBroadcaster> {
+        task::spawn(async move {
+            let select = stream::select(self.rebroadcast, self.broadcast);
+
+            pin_mut!(select);
+
+            loop {
+                if let Some(msg) = select.next().await {
+                    let errors = self
+                        .beb
+                        .broadcast(&msg)
+                        .instrument(debug_span!("beb_broadcast"))
+                        .await;
+
+                    if self.errors.send(errors).await.is_err() {
+                        return self.beb;
+                    }
+                } else {
+                    return self.beb;
+                }
+            }
+        })
     }
 }
 

@@ -1,20 +1,16 @@
 use std::collections::HashSet;
 
 use super::besteffort::*;
-use super::{BroadcastError, Broadcaster, Deliverer};
+use super::{BroadcastTask, Broadcaster, Deliverer};
 use crate::{Message, System};
 
 use drop::async_trait;
 use drop::crypto::key::exchange::PublicKey;
 use drop::net::SendError;
 
-use futures::{pin_mut, stream, StreamExt};
-
 use tokio::sync::mpsc;
-use tokio::task::{self, JoinHandle};
 
-use tracing::{debug_span, error};
-use tracing_futures::Instrument;
+use tracing::error;
 
 /// An implementation of `Broadcast` that provides the following guarantees:
 /// * a `Message` is delivered exactly once
@@ -73,8 +69,14 @@ impl<M: Message> Broadcaster<M> for ReliableMultiShotBroadcaster<M> {
             self.errors_in.recv().await.unwrap_or(None)
         }
     }
+
+    fn known_peers(&self) -> HashSet<PublicKey> {
+        todo!()
+    }
 }
 
+/// The delivery end of the reliable multishot broadcast primitive.
+/// See `ReliableMultiShot` for more information.
 pub struct ReliableMultiShotDeliverer<M: Message + 'static> {
     beb: BestEffortReceiver<M>,
     rebroadcast: mpsc::Sender<M>,
@@ -105,60 +107,6 @@ impl<M: Message + 'static> Deliverer<M> for ReliableMultiShotDeliverer<M> {
                 return Some((pkey, message));
             }
         }
-    }
-}
-
-struct BroadcastTask<M: Message + 'static> {
-    rebroadcast: mpsc::Receiver<M>,
-    broadcast: mpsc::Receiver<M>,
-    errors: mpsc::Sender<Option<Vec<(PublicKey, SendError)>>>,
-    beb: BestEffortBroadcaster,
-}
-
-impl<M: Message + 'static> BroadcastTask<M> {
-    fn spawn(
-        beb: BestEffortBroadcaster,
-        broadcast: mpsc::Receiver<M>,
-        rebroadcast: mpsc::Receiver<M>,
-    ) -> (
-        mpsc::Receiver<BroadcastError>,
-        JoinHandle<BestEffortBroadcaster>,
-    ) {
-        let (errors, errors_rx) = mpsc::channel(1);
-
-        let handle = Self {
-            beb,
-            broadcast,
-            rebroadcast,
-            errors,
-        }
-        .task();
-
-        (errors_rx, handle)
-    }
-
-    fn task(mut self) -> JoinHandle<BestEffortBroadcaster> {
-        task::spawn(async move {
-            let select = stream::select(self.rebroadcast, self.broadcast);
-
-            pin_mut!(select);
-
-            loop {
-                if let Some(msg) = select.next().await {
-                    let errors = self
-                        .beb
-                        .broadcast(&msg)
-                        .instrument(debug_span!("beb_broadcast"))
-                        .await;
-
-                    if self.errors.send(errors).await.is_err() {
-                        return self.beb;
-                    }
-                } else {
-                    return self.beb;
-                }
-            }
-        })
     }
 }
 
