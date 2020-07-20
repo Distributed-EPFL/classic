@@ -4,6 +4,7 @@
 //! This crate provides common abstraction used in distributed systems
 //! on top of the lower level `drop` crate.
 
+use std::collections::VecDeque;
 use std::fmt;
 use std::hash::Hash;
 
@@ -14,6 +15,9 @@ pub use broadcast::*;
 
 mod system;
 pub use system::System;
+
+mod connection;
+pub use connection::{ConnectionError, ConnectionHandle};
 
 #[cfg(test)]
 pub mod test;
@@ -31,3 +35,14 @@ pub trait Message:
     + Eq
 {
 }
+
+macro_rules! impl_m {
+    ( $($t:ty),* ) => {
+        $( impl Message for $t {} )*
+    };
+}
+
+impl_m!(u8, i8, u16, i16, u32, i32, u64, i64, u128, i128, usize, String);
+
+impl<T: Message> Message for Vec<T> {}
+impl<T: Message> Message for VecDeque<T> {}
