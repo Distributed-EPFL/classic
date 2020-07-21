@@ -2,20 +2,20 @@ use std::fmt;
 use std::future::Future;
 use std::marker::Send;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::Message;
 
 use drop::crypto::key::exchange::PublicKey;
-use drop::net::{
-    Connection, ConnectionRead, ConnectionWrite, Connector, Listener,
-};
+use drop::net::{Connection, ConnectionRead, ConnectionWrite, Connector};
 
 use futures::{Stream, StreamExt, TryStreamExt};
 
-use snafu::{OptionExt, ResultExt, Snafu};
+use snafu::{OptionExt, Snafu};
 
 use tokio::sync::{broadcast, mpsc, Mutex};
 use tokio::task::{self, JoinError, JoinHandle};
+use tokio::time::delay_for;
 
 use tracing::{debug, debug_span, error, info, warn};
 use tracing_futures::Instrument;
@@ -142,34 +142,34 @@ where
 }
 
 /// Handle used to receive and send messages from a shared `Connection`
-pub struct ConnectionHandle<M, C, A>
+pub struct ConnectionHandle<M>
 where
     M: Message + 'static,
-    C: Connector<Candidate = A>,
-    A: Send + Sync + fmt::Display,
 {
     bcast: broadcast::Sender<Result<Arc<M>, ConnectionError>>,
     receiver: broadcast::Receiver<Result<Arc<M>, ConnectionError>>,
     sender: mpsc::Sender<M>,
     pkey: Arc<PublicKey>,
-    connector: Option<Arc<C>>,
-    candidate: Option<Arc<A>>,
     receive_handle: SharedJoinHandle<ConnectionReceiver<M>>,
     send_handle: SharedJoinHandle<ConnectionSender<M>>,
+    reconnect: mpsc::Sender<()>,
+    connection_in: Arc<Mutex<mpsc::Receiver<Connection>>>,
 }
 
-impl<M, C, A> ConnectionHandle<M, C, A>
+impl<M> ConnectionHandle<M>
 where
     M: Message + 'static,
-    C: Connector<Candidate = A>,
-    A: Send + Sync + fmt::Display,
 {
     /// Create a new `ConnectionHandle` to the given peer.
-    pub async fn connect(
+    pub async fn connect<C, A>(
         connector: C,
         candidate: A,
         pkey: PublicKey,
-    ) -> Result<Self, ConnectionError> {
+    ) -> Result<Self, ConnectionError>
+    where
+        C: Connector<Candidate = A> + 'static,
+        A: Send + Sync + fmt::Display + 'static,
+    {
         let connection =
             connector.connect(&pkey, &candidate).await.map_err(|e| {
                 error!("failed to connect to {}: {}", candidate, e);
@@ -178,31 +178,22 @@ where
         let connector = Arc::new(connector);
         let candidate = Arc::new(candidate);
 
-        Self::setup(connection, pkey, Some(connector), Some(candidate))
+        Self::setup(connection, pkey, connector, candidate)
     }
 
-    /// Create a new `ConnectionHandle` for an incoming `Connection` using the
-    /// provided `Listener`
-    pub async fn accept<L: Listener<Candidate = A>>(
-        listener: &mut L,
-    ) -> Result<Self, ConnectionError> {
-        let connection = listener.accept().await.map_err(|e| {
-            error!("failed to accept connection: {}", e);
-            Connect.build()
-        })?;
-
-        let pkey = connection.remote_key().context(HandshakeFailed)?;
-
-        Self::setup(connection, pkey, None, None)
-    }
-
-    fn setup(
+    fn setup<C, A>(
         connection: Connection,
         pkey: PublicKey,
-        connector: Option<Arc<C>>,
-        candidate: Option<Arc<A>>,
-    ) -> Result<Self, ConnectionError> {
+        connector: Arc<C>,
+        candidate: Arc<A>,
+    ) -> Result<Self, ConnectionError>
+    where
+        C: Connector<Candidate = A> + 'static,
+        A: Send + Sync + fmt::Display + 'static,
+    {
         let pkey = Arc::new(pkey);
+
+        let (reconnect_tx, reconnect_rx) = mpsc::channel(1);
 
         let (recv_tx, recv_rx) = broadcast::channel(32);
         let (send_tx, send_rx) = mpsc::channel(32);
@@ -234,15 +225,22 @@ where
                 .instrument(debug_span!("receiver", remote = %pkey)),
         ));
 
+        let connection_in = Arc::new(Mutex::new(Reconnector::spawn(
+            pkey.clone(),
+            reconnect_rx,
+            connector,
+            candidate,
+        )));
+
         Ok(Self {
             bcast: recv_tx,
             receiver: recv_rx,
             sender: send_tx,
+            reconnect: reconnect_tx,
+            connection_in,
             pkey,
             send_handle,
             receive_handle,
-            connector,
-            candidate,
         })
     }
 
@@ -251,20 +249,11 @@ where
     /// `Connection` is broken and needs a reconnection.
     /// If the reconnection fails all handles to this `Connection` will fail.
     pub async fn reconnect(&mut self) -> Result<(), ConnectionError> {
-        match (self.connector.as_ref(), self.candidate.as_ref()) {
-            (Some(_), Some(_)) => self.reconnect_internal().await,
-            (_, _) => {
-                error!("can't reconnect an incoming connection");
-                ConnectionClosed.fail()
-            }
-        }
+        self.reconnect_internal().await
     }
 
     async fn reconnect_internal(&mut self) -> Result<(), ConnectionError> {
-        let connector = self.connector.as_ref().unwrap();
-        let candidate = self.candidate.as_ref().unwrap();
-
-        info!("attempting reconnection to {}", candidate);
+        info!("attempting reconnection to {}", self.pkey);
 
         let receiver = self.receive_handle.try_join().await;
         let sender = self.send_handle.try_join().await;
@@ -272,6 +261,7 @@ where
         let (mut receiver, mut sender) = match (receiver, sender) {
             (None, None) => {
                 debug!("already reconnecting");
+                self.connection_in.lock().await;
                 return Ok(());
             }
             (None, Some(_)) | (Some(_), None) => panic!("application bug"),
@@ -279,16 +269,18 @@ where
             (Some(Ok(receiver)), Some(Ok(sender))) => (receiver, sender),
         };
 
-        debug!("handler are finished, reconnecting to {}", candidate);
+        if self.reconnect.send(()).await.is_err() {
+            error!("reconnector isn't running, failed reconnection");
+            return Fatal.fail();
+        }
 
-        let connection = connector
-            .connect(&self.pkey, &candidate)
+        let connection = self
+            .connection_in
+            .lock()
             .await
-            .map_err(|_| {
-                error!("error reconnecting to {}", candidate);
-                snafu::NoneError
-            })
-            .context(Connect)?;
+            .recv()
+            .await
+            .context(ConnectionClosed)?;
 
         let (read, write) = connection.split().context(HandshakeFailed)?;
 
@@ -356,11 +348,9 @@ where
     }
 }
 
-impl<M, C, A> Clone for ConnectionHandle<M, C, A>
+impl<M> Clone for ConnectionHandle<M>
 where
     M: Message + 'static,
-    C: Connector<Candidate = A>,
-    A: Send + Sync + fmt::Display,
 {
     fn clone(&self) -> Self {
         debug!("created new handle");
@@ -370,11 +360,109 @@ where
             bcast: self.bcast.clone(),
             receiver: self.bcast.subscribe(),
             sender: self.sender.clone(),
-            candidate: self.candidate.clone(),
-            connector: self.connector.clone(),
             send_handle: self.send_handle.clone(),
             receive_handle: self.receive_handle.clone(),
+            connection_in: self.connection_in.clone(),
+            reconnect: self.reconnect.clone(),
         }
+    }
+}
+
+struct Reconnector<C, A>
+where
+    C: Connector<Candidate = A> + 'static,
+    A: fmt::Display + Send + Sync,
+{
+    candidate: Arc<A>,
+    connector: Arc<C>,
+    reconnect: mpsc::Receiver<()>,
+    pkey: Arc<PublicKey>,
+}
+
+impl<C, A> Reconnector<C, A>
+where
+    C: Connector<Candidate = A> + 'static,
+    A: fmt::Display + Send + Sync + 'static,
+{
+    fn spawn(
+        pkey: Arc<PublicKey>,
+        reconnect: mpsc::Receiver<()>,
+        connector: Arc<C>,
+        candidate: Arc<A>,
+    ) -> mpsc::Receiver<Connection> {
+        let r = Self {
+            connector,
+            candidate,
+            reconnect,
+            pkey,
+        };
+
+        r.run()
+    }
+
+    fn run(mut self) -> mpsc::Receiver<Connection> {
+        let (mut conn_tx, conn_rx) = mpsc::channel(1);
+        let candidate = self.candidate.clone();
+
+        task::spawn(
+            async move {
+                let mut backoff = 1;
+
+                debug!("started reconnector");
+
+                loop {
+                    match self.reconnect.recv().await {
+                        Some(_) => loop {
+                            debug!("reconnection request");
+                            let connection = self
+                                .connector
+                                .connect(&self.pkey, &self.candidate)
+                                .await;
+
+                            match connection {
+                                Ok(connection) => {
+                                    debug!("reconnection successful");
+
+                                    if conn_tx.send(connection).await.is_err() {
+                                        error!(
+                                            "reconnection finished too late"
+                                        );
+                                        return;
+                                    }
+
+                                    backoff = 1;
+                                    break;
+                                }
+                                Err(e) => {
+                                    error!(
+                                        "reconnection to {} failed: {}",
+                                        self.candidate, e
+                                    );
+                                    backoff *= 2;
+                                    debug!(
+                                        "trying again in {} seconds",
+                                        backoff
+                                    );
+
+                                    delay_for(Duration::from_secs(backoff))
+                                        .await;
+                                }
+                            }
+                        },
+                        None => {
+                            info!(
+                                "no more connection handle to {}",
+                                self.candidate
+                            );
+                            return;
+                        }
+                    }
+                }
+            }
+            .instrument(debug_span!("reconnector", candidate = %candidate)),
+        );
+
+        conn_rx
     }
 }
 
@@ -490,7 +578,7 @@ mod test {
             connection.send(&0usize).await.expect("failed to send");
         });
 
-        let connection = ConnectionHandle::<usize, _, _>::connect(
+        let connection = ConnectionHandle::<usize>::connect(
             TcpConnector::new(client_keypair),
             addr,
             server_key,
@@ -522,7 +610,7 @@ mod test {
             listener.accept().await.expect("accept failed");
         });
 
-        let mut connection = ConnectionHandle::<usize, _, _>::connect(
+        let mut connection = ConnectionHandle::<usize>::connect(
             TcpConnector::new(client_keypair),
             addr,
             server_key,
@@ -563,7 +651,7 @@ mod test {
             connection.send(&0usize).await.expect("send failed");
         });
 
-        let mut connection = ConnectionHandle::<usize, _, _>::connect(
+        let mut connection = ConnectionHandle::<usize>::connect(
             TcpConnector::new(client_keypair),
             addr,
             server_key,
