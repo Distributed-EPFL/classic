@@ -1,5 +1,4 @@
 use std::fmt;
-use std::future::Future;
 use std::marker::Send;
 use std::sync::Arc;
 use std::time::Duration;
@@ -73,25 +72,23 @@ impl<M> ConnectionReceiver<M>
 where
     M: Message + 'static,
 {
-    fn task(mut self) -> impl Future<Output = Self> {
-        async move {
-            loop {
-                match self.read.receive().await {
-                    Err(e) => {
-                        error!("connection receiver error: {}", e);
-                        let _ = self.notify.send(()).await;
-                        if self.sender.send(Reconnect.fail()).is_err() {
-                            warn!("no more connection handle");
-                        }
-                        return self;
+    async fn task(mut self) -> Self {
+        loop {
+            match self.read.receive().await {
+                Err(e) => {
+                    error!("connection receiver error: {}", e);
+                    let _ = self.notify.send(()).await;
+                    if self.sender.send(Reconnect.fail()).is_err() {
+                        warn!("no more connection handle");
                     }
-                    Ok(msg) => {
-                        let msg = Arc::new(msg);
+                    return self;
+                }
+                Ok(msg) => {
+                    let msg = Arc::new(msg);
 
-                        if self.sender.send(Ok(msg)).is_err() {
-                            error!("no more connection handle",);
-                            return self;
-                        }
+                    if self.sender.send(Ok(msg)).is_err() {
+                        error!("no more connection handle",);
+                        return self;
                     }
                 }
             }
@@ -109,35 +106,33 @@ impl<M> ConnectionSender<M>
 where
     M: Message + 'static,
 {
-    fn task(mut self) -> impl Future<Output = Self> {
-        async move {
-            loop {
-                tokio::select! {
-                    result = self.receiver.recv() =>  {
-                        match result {
-                            Some(ref message) => {
-                                if let Err(e) = self.write.send(message).await {
-                                    error!("writing message failed: {}", e);
-                                    break;
-                                }
-                            }
-                            None => {
+    async fn task(mut self) -> Self {
+        loop {
+            tokio::select! {
+                result = self.receiver.recv() =>  {
+                    match result {
+                        Some(ref message) => {
+                            if let Err(e) = self.write.send(message).await {
+                                error!("writing message failed: {}", e);
                                 break;
                             }
                         }
-                    }
-
-                    _ = self.notify.recv() => {
-                        debug!("stopping send loop after receive error");
-                        break;
+                        None => {
+                            break;
+                        }
                     }
                 }
+
+                _ = self.notify.recv() => {
+                    debug!("stopping send loop after receive error");
+                    break;
+                }
             }
-
-            debug!("connection sender ending");
-
-            return self;
         }
+
+        debug!("connection sender ending");
+
+        self
     }
 }
 
