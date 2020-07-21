@@ -14,7 +14,6 @@ tracing = "~0.1"
 serde = "~1.0"
 hashbrown = "~0.7"
 tracing-futures = "~0.2"
-error-chain = "~0.12"
 peroxide = "~0.23"
 snafu = "0.6"
 
