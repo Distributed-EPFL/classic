@@ -73,6 +73,8 @@ pub async fn create_receivers<
     output
 }
 
+/// Helper to create a `System` using a number of connection to open
+/// and some user defined action once the connection has been established
 pub async fn create_system<
     C: Fn(Connection) -> F + Clone + Sync + Send + 'static,
     F: Future<Output = ()> + Send + Sync,
