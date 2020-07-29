@@ -34,8 +34,6 @@ pub use uniform::{
     UniformReliable, UniformReliableBroadcaster, UniformReliableDeliverer,
 };
 
-mod doubleecho;
-
 /// This is the error type returned by `Broadcaster::broadcast`.
 /// If this value is `None` the `Broadcaster` is not in an usable state anymore
 /// and should be dropped.
