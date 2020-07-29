@@ -19,6 +19,9 @@ pub use system::System;
 mod connection;
 pub use connection::{ConnectionError, ConnectionHandle};
 
+mod manager;
+pub use manager::{Processor, SystemManager};
+
 #[cfg(test)]
 pub mod test;
 
