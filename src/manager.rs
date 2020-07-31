@@ -7,15 +7,15 @@ use super::{Message, System};
 
 use drop::async_trait;
 use drop::crypto::key::exchange::PublicKey;
-use drop::net::{Connection, ConnectionRead, ConnectionWrite, SendError};
+use drop::net::{Connection, ConnectionRead, ConnectionWrite};
 
 use futures::future::{self, FutureExt};
 use futures::Stream;
 
-use snafu::{ResultExt, Snafu};
+use snafu::Snafu;
 
 use tokio::sync::mpsc;
-use tokio::task::{self, JoinHandle};
+use tokio::task;
 
 use tracing::{debug, debug_span, error, info, warn};
 use tracing_futures::Instrument;
@@ -31,17 +31,22 @@ pub enum ProcessorStatus {
 }
 
 #[async_trait]
+/// Trait used to process incoming messages from a `SystemManager`
 pub trait Processor<M: Message, O: Message>: Send + Sync {
+    /// The handle used to send and receive messages from the `Processor`
     type Handle;
 
+    /// Process an incoming message using this `Processor`
     async fn process(
-        &self,
+        self: Arc<Self>,
         message: &M,
         from: PublicKey,
-        sender: Arc<Sender<Arc<M>>>,
+        sender: Arc<Sender<M>>,
     );
 
-    async fn output(&mut self, sender: Arc<Sender<Arc<M>>>) -> Self::Handle;
+    /// Setup the `Processor` using the given sender map and returns a `Handle`
+    /// for the user to use.
+    async fn output(&mut self, sender: Arc<Sender<M>>) -> Self::Handle;
 }
 
 #[derive(Snafu, Debug)]
@@ -114,7 +119,7 @@ impl<M: Message + 'static> SystemManager<M> {
 
         debug!("setting up dispatcher...");
 
-        let sender = Arc::new(Sender {
+        let sender: Arc<Sender<M>> = Arc::new(Sender {
             connections: network_out,
         });
 
@@ -259,17 +264,29 @@ impl<M: Message + 'static> SystemManager<M> {
     }
 }
 
+/// A handle to send messages to other known processes
 pub struct Sender<M> {
-    connections: HashMap<PublicKey, mpsc::Sender<M>>,
+    connections: HashMap<PublicKey, mpsc::Sender<Arc<M>>>,
 }
 
 impl<M> Sender<M> {
-    pub fn send_to(&self, pkey: &PublicKey, message: &M) {
+    /// Send a message to a single remote process
+    pub async fn send_to(&self, pkey: &PublicKey, message: &M) {
         todo!()
     }
 
-    pub fn send_many(&self, message: &M, keys: Vec<PublicKey>) {
+    /// Send a message to many remote process
+    pub async fn send_many<'a, I: Iterator<Item = &'a PublicKey>>(
+        &self,
+        message: Arc<M>,
+        keys: I,
+    ) {
         todo!()
+    }
+
+    /// Get an `Iterator` of all known keys in this `Sender`
+    pub fn keys(&self) -> impl Iterator<Item = &PublicKey> {
+        self.connections.keys()
     }
 }
 
@@ -296,10 +313,10 @@ mod test {
             type Handle = mpsc::Receiver<(PublicKey, usize)>;
 
             async fn process(
-                &self,
+                self: Arc<Self>,
                 message: &usize,
                 key: PublicKey,
-                sender: Arc<Sender<Arc<usize>>>,
+                sender: Arc<Sender<usize>>,
             ) {
                 self.sender
                     .as_ref()
@@ -312,7 +329,7 @@ mod test {
 
             async fn output(
                 &mut self,
-                sender: Arc<Sender<Arc<usize>>>,
+                sender: Arc<Sender<usize>>,
             ) -> Self::Handle {
                 let (tx, rx) = mpsc::channel(128);
 
