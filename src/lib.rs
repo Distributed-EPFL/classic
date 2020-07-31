@@ -20,7 +20,7 @@ mod connection;
 pub use connection::{ConnectionError, ConnectionHandle};
 
 mod manager;
-pub use manager::{Processor, SystemManager};
+pub use manager::{Processor, Sender, SystemManager};
 
 #[cfg(test)]
 pub mod test;
