@@ -12,7 +12,7 @@ use drop::net::{Connection, ConnectionRead, ConnectionWrite};
 use futures::future::{self, FutureExt};
 use futures::Stream;
 
-use snafu::Snafu;
+use snafu::{OptionExt, ResultExt, Snafu};
 
 use tokio::sync::mpsc;
 use tokio::task;
@@ -264,6 +264,14 @@ impl<M: Message + 'static> SystemManager<M> {
     }
 }
 
+#[derive(Debug, Snafu)]
+pub enum SenderError {
+    #[snafu(display("peer is unknown"))]
+    NoSuchPeer,
+    #[snafu(display("connection is broken"))]
+    ChannelClosed,
+}
+
 /// A handle to send messages to other known processes
 pub struct Sender<M> {
     connections: HashMap<PublicKey, mpsc::Sender<Arc<M>>>,
@@ -271,17 +279,30 @@ pub struct Sender<M> {
 
 impl<M> Sender<M> {
     /// Send a message to a single remote process
-    pub async fn send_to(&self, pkey: &PublicKey, message: &M) {
-        todo!()
+    pub async fn send_to(
+        &self,
+        pkey: &PublicKey,
+        message: Arc<M>,
+    ) -> Result<(), SenderError> {
+        self.connections
+            .get(pkey)
+            .context(NoSuchPeer)?
+            .clone()
+            .send(message)
+            .await
+            .map_err(|_| snafu::NoneError)
+            .context(ChannelClosed)
     }
 
-    /// Send a message to many remote process
+    /// Send a message to many remote processes
     pub async fn send_many<'a, I: Iterator<Item = &'a PublicKey>>(
         &self,
         message: Arc<M>,
         keys: I,
     ) {
-        todo!()
+        for key in keys {
+            self.send_to(key, message.clone()).await;
+        }
     }
 
     /// Get an `Iterator` of all known keys in this `Sender`
