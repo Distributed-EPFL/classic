@@ -20,16 +20,6 @@ use tokio::task;
 use tracing::{debug, debug_span, error, info, warn};
 use tracing_futures::Instrument;
 
-/// Status of a `MessageProcessor` after processing one message.
-pub enum ProcessorStatus {
-    /// Indicate to the `SystemManager` that this `Processor` can process
-    /// more messages
-    Continue,
-    /// Indicate to the `SystemManager` that this `Processor` is done processing
-    /// messages
-    Stop,
-}
-
 #[async_trait]
 /// Trait used to process incoming messages from a `SystemManager`
 pub trait Processor<M: Message, O: Message>: Send + Sync {
@@ -92,9 +82,9 @@ impl<M: Message + 'static> SystemManager<M> {
     }
 
     /// Start the `SystemManager`. <br />
-    /// Call this once you registered all required `MessageProcessor`s to begin
-    /// processing and sending messages. This will run until all processors have
-    /// failed/terminated
+    /// Call this after you registered one `Processor`s to begin processing and
+    /// sending messages. This will return a `Handle` that allows interaction
+    /// with the `Processor`.
     pub async fn run<
         P: Processor<M, O, Handle = H> + 'static,
         O: Message,
@@ -301,7 +291,9 @@ impl<M> Sender<M> {
         keys: I,
     ) {
         for key in keys {
-            self.send_to(key, message.clone()).await;
+            if let Err(e) = self.send_to(key, message.clone()).await {
+                error!("send failure for {}: {}", key, e);
+            }
         }
     }
 
@@ -337,7 +329,7 @@ mod test {
                 self: Arc<Self>,
                 message: &usize,
                 key: PublicKey,
-                sender: Arc<Sender<usize>>,
+                _sender: Arc<Sender<usize>>,
             ) {
                 self.sender
                     .as_ref()
@@ -350,7 +342,7 @@ mod test {
 
             async fn output(
                 &mut self,
-                sender: Arc<Sender<usize>>,
+                _sender: Arc<Sender<usize>>,
             ) -> Self::Handle {
                 let (tx, rx) = mpsc::channel(128);
 
@@ -368,7 +360,7 @@ mod test {
             })
             .await;
 
-        let mut processor = Dummy::default();
+        let processor = Dummy::default();
         let manager = SystemManager::new(system);
 
         debug!("manager created");
@@ -376,6 +368,7 @@ mod test {
         debug!("registering processor");
 
         let mut handle = manager.run(processor).await;
+        let mut messages = Vec::with_capacity(COUNT);
 
         for _ in 0..COUNT {
             let (pkey, message) =
@@ -385,7 +378,17 @@ mod test {
                 pkeys.iter().any(|(key, _)| *key == pkey),
                 "bad message sender"
             );
+
+            messages.push(message);
         }
+
+        messages.sort();
+
+        assert_eq!(
+            messages,
+            (0..COUNT).collect::<Vec<_>>(),
+            "incorrect message sequence"
+        );
 
         handles.await.expect("system failure");
     }
