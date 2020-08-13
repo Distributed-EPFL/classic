@@ -12,14 +12,17 @@ use futures::future;
 
 use tokio::task::{self, JoinHandle};
 
-use tracing::info;
+use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
 
 static PORT_OFFSET: AtomicU16 = AtomicU16::new(0);
 
 /// Initialize an asynchronous logger for test environment
 pub fn init_logger() {
-    if let Some(level) = env::var("RUST_LOG").ok().map(|x| x.parse().ok()) {
+    let var: Option<Level> =
+        env::var("RUST_LOG").ok().map(|x| x.parse().ok()).flatten();
+
+    if let Some(level) = var {
         let subscriber =
             FmtSubscriber::builder().with_max_level(level).finish();
 
