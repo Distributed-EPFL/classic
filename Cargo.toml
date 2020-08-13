@@ -19,3 +19,4 @@ snafu = "0.6"
 
 [dev-dependencies]
 tracing-subscriber = "*"
+lazy_static = "*"
