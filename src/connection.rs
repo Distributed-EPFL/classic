@@ -8,7 +8,7 @@ use crate::Message;
 use drop::crypto::key::exchange::PublicKey;
 use drop::net::{Connection, ConnectionRead, ConnectionWrite, Connector};
 
-use futures::{Stream, StreamExt, TryStreamExt};
+use futures::{Stream, StreamExt};
 
 use snafu::{OptionExt, Snafu};
 
