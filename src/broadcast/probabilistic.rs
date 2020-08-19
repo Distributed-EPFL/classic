@@ -47,7 +47,7 @@ enum PcbMessage<M: Message> {
 impl<M: Message> Hash for PcbMessage<M> {
     fn hash<H: Hasher>(&self, h: &mut H) {
         match self {
-            PcbMessage::Gossip(pkey, signature, message) => {
+            PcbMessage::Gossip(_, signature, message) => {
                 signature.hash(h);
                 message.hash(h);
             }
@@ -126,7 +126,7 @@ impl<M: Message + 'static> Processor<PcbMessage<M>, M> for Probabilistic<M> {
         self: Arc<Self>,
         message: &PcbMessage<M>,
         from: PublicKey,
-        sender: Arc<Sender<PcbMessage<M>>>,
+        sender: Arc<Sender>,
     ) {
         match message {
             PcbMessage::Subscribe => {
@@ -137,6 +137,11 @@ impl<M: Message + 'static> Processor<PcbMessage<M>, M> for Probabilistic<M> {
                 if *pkey == self.sender {
                     let mut signer = Signer::new(self.keypair.deref().clone());
                     let mut delivered = self.delivered.lock().await;
+
+                    if delivered.is_some() {
+                        debug!("already delivered a message");
+                        return;
+                    }
 
                     if signer.verify(&signature, pkey, content).is_ok() {
                         debug!("good signature for {:?}", message);
@@ -162,17 +167,17 @@ impl<M: Message + 'static> Processor<PcbMessage<M>, M> for Probabilistic<M> {
         }
     }
 
-    async fn output(
-        &mut self,
-        msg_sender: Arc<Sender<PcbMessage<M>>>,
-    ) -> Self::Handle {
+    async fn output(&mut self, msg_sender: Arc<Sender>) -> Self::Handle {
         let (sender, mut receiver) = mpsc::channel(128);
-        let count = msg_sender.keys().count();
+        let keys = msg_sender.keys().await;
+        let count = keys.len();
         let prob = self.expected as f64 / count as f64;
         let sampler = Bernoulli(prob);
 
         let sample = msg_sender
             .keys()
+            .await
+            .into_iter()
             .zip(sampler.sample(count))
             .filter_map(
                 |(key, select)| if select >= 1.0 { Some(key) } else { None },

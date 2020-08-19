@@ -10,11 +10,11 @@ use drop::crypto::key::exchange::PublicKey;
 use drop::net::{Connection, ConnectionRead, ConnectionWrite};
 
 use futures::future::{self, FutureExt};
-use futures::Stream;
+use futures::{Stream, StreamExt};
 
 use snafu::{OptionExt, ResultExt, Snafu};
 
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio::task;
 
 use tracing::{debug, debug_span, error, info, warn};
@@ -31,12 +31,12 @@ pub trait Processor<M: Message, O: Message>: Send + Sync {
         self: Arc<Self>,
         message: &M,
         from: PublicKey,
-        sender: Arc<Sender<M>>,
+        sender: Arc<Sender>,
     );
 
     /// Setup the `Processor` using the given sender map and returns a `Handle`
     /// for the user to use.
-    async fn output(&mut self, sender: Arc<Sender<M>>) -> Self::Handle;
+    async fn output(&mut self, sender: Arc<Sender>) -> Self::Handle;
 }
 
 #[derive(Snafu, Debug)]
@@ -57,7 +57,8 @@ pub struct SystemManager<M: Message + 'static> {
     _m: PhantomData<M>,
     reads: Vec<ConnectionRead>,
     writes: Vec<ConnectionWrite>,
-    incoming: Box<dyn Stream<Item = Connection> + Send>,
+    /// `Stream` of incoming `Connection`s
+    incoming: Box<dyn Stream<Item = Connection> + Send + Unpin>,
 }
 
 impl<M: Message + 'static> SystemManager<M> {
@@ -97,20 +98,23 @@ impl<M: Message + 'static> SystemManager<M> {
 
         info!("beginning system setup");
 
-        let senders = self
-            .writes
-            .into_iter()
-            .map(|x| Self::send(x))
-            .collect::<Vec<_>>();
-
-        let network_out = senders.into_iter().collect::<HashMap<_, _>>();
-
-        debug!("send task setup finished");
-
         debug!("setting up dispatcher...");
 
-        let sender: Arc<Sender<M>> = Arc::new(Sender {
-            connections: network_out,
+        let sender = Arc::new(Sender::new(self.writes));
+        let sender_add = sender.clone();
+        let mut incoming = self.incoming;
+
+        task::spawn(async move {
+            while let Some(connection) = incoming.next().await {
+                // TODO: send the read end of the connection to receive task
+                if let Some((_, write)) = connection.split() {
+                    debug!(
+                        "new incoming connection from {}",
+                        write.remote_pkey()
+                    );
+                    sender_add.add_connection(write).await;
+                }
+            }
         });
 
         let handle = processor.output(sender.clone()).await;
@@ -139,38 +143,6 @@ impl<M: Message + 'static> SystemManager<M> {
         debug!("done setting up dispatcher! system now running");
 
         handle
-    }
-
-    fn send(mut write: ConnectionWrite) -> (PublicKey, mpsc::Sender<Arc<M>>) {
-        let (outgoing_tx, mut outgoing_rx) = mpsc::channel(128);
-
-        let pkey = *write.remote_pkey();
-
-        task::spawn(
-            async move {
-                debug!("send task started");
-
-                loop {
-                    let message: Option<Arc<M>> = outgoing_rx.recv().await;
-
-                    match message {
-                        Some(msg) => {
-                            if let Err(e) = write.send(msg.deref()).await {
-                                error!("error sending to {}: {}", pkey, e);
-                                return Err(e);
-                            }
-                        }
-                        None => {
-                            warn!("no more messages, exiting");
-                            return Ok(());
-                        }
-                    }
-                }
-            }
-            .instrument(debug_span!("send_task", remote = %pkey)),
-        );
-
-        (pkey, outgoing_tx)
     }
 
     fn receive(
@@ -255,37 +227,73 @@ impl<M: Message + 'static> SystemManager<M> {
 }
 
 #[derive(Debug, Snafu)]
+/// Error returned by `Sender` when attempting to send `Message`s
 pub enum SenderError {
     #[snafu(display("peer is unknown"))]
+    /// The destination `PublicKey` was not known by this `Sender`
     NoSuchPeer,
     #[snafu(display("connection is broken"))]
-    ChannelClosed,
+    /// The `Connection` encountered an error while sending
+    ConnectionError,
 }
 
 /// A handle to send messages to other known processes
-pub struct Sender<M> {
-    connections: HashMap<PublicKey, mpsc::Sender<Arc<M>>>,
+pub struct Sender {
+    connections: RwLock<HashMap<PublicKey, Mutex<ConnectionWrite>>>,
 }
 
-impl<M> Sender<M> {
+impl Sender {
+    /// Create a new `Sender` from a `Vec` of `ConnectionWrite`
+    pub fn new<I: IntoIterator<Item = ConnectionWrite>>(writes: I) -> Self {
+        let connections = writes
+            .into_iter()
+            .map(|x| (*x.remote_pkey(), Mutex::new(x)))
+            .collect::<HashMap<_, _>>();
+
+        Self {
+            connections: RwLock::new(connections),
+        }
+    }
+
+    /// Add a new `ConnectionWrite` to this `Sender`
+    pub async fn add_connection(&self, write: ConnectionWrite) {
+        if let Some(conn) = self
+            .connections
+            .write()
+            .await
+            .insert(*write.remote_pkey(), Mutex::new(write))
+        {
+            let pkey = *conn.lock().await.remote_pkey();
+            warn!("replaced connection to {}, messages may be dropped", pkey);
+        }
+    }
+
     /// Send a message to a single remote process
-    pub async fn send_to(
+    pub async fn send_to<M: Message>(
         &self,
         pkey: &PublicKey,
         message: Arc<M>,
     ) -> Result<(), SenderError> {
         self.connections
+            .read()
+            .await
             .get(pkey)
             .context(NoSuchPeer)?
-            .clone()
-            .send(message)
+            .lock()
+            .await
+            .send(message.deref())
             .await
             .map_err(|_| snafu::NoneError)
-            .context(ChannelClosed)
+            .context(ConnectionError)
+        // FIXME: error forwarding once drop has good errors
     }
 
     /// Send a message to many remote processes
-    pub async fn send_many<'a, I: Iterator<Item = &'a PublicKey>>(
+    pub async fn send_many<
+        'a,
+        I: Iterator<Item = &'a PublicKey>,
+        M: Message,
+    >(
         &self,
         message: Arc<M>,
         keys: I,
@@ -297,9 +305,9 @@ impl<M> Sender<M> {
         }
     }
 
-    /// Get an `Iterator` of all known keys in this `Sender`
-    pub fn keys(&self) -> impl Iterator<Item = &PublicKey> {
-        self.connections.keys()
+    /// Get an `Iterator` of all known keys in this `Sender`.
+    pub async fn keys(&self) -> Vec<PublicKey> {
+        self.connections.read().await.keys().map(|x| *x).collect()
     }
 }
 
@@ -312,7 +320,6 @@ mod test {
 
     #[tokio::test(threaded_scheduler)]
     async fn receive_from_manager() {
-        static DELIVERED: AtomicUsize = AtomicUsize::new(0);
         static COUNTER: AtomicUsize = AtomicUsize::new(0);
         const COUNT: usize = 50;
 
@@ -329,7 +336,7 @@ mod test {
                 self: Arc<Self>,
                 message: &usize,
                 key: PublicKey,
-                _sender: Arc<Sender<usize>>,
+                _sender: Arc<Sender>,
             ) {
                 self.sender
                     .as_ref()
@@ -340,10 +347,7 @@ mod test {
                     .expect("channel failure");
             }
 
-            async fn output(
-                &mut self,
-                _sender: Arc<Sender<usize>>,
-            ) -> Self::Handle {
+            async fn output(&mut self, _sender: Arc<Sender>) -> Self::Handle {
                 let (tx, rx) = mpsc::channel(128);
 
                 self.sender.replace(tx);
