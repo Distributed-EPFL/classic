@@ -29,6 +29,9 @@ pub use multishot::{
     ReliableMultiShot, ReliableMultiShotBroadcaster, ReliableMultiShotDeliverer,
 };
 
+mod sieve;
+pub use sieve::{Sieve, SieveHandle};
+
 mod uniform;
 pub use uniform::{
     UniformReliable, UniformReliableBroadcaster, UniformReliableDeliverer,
