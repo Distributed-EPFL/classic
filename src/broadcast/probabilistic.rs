@@ -38,12 +38,13 @@ pub enum BroadcastError {
 }
 
 #[derive(Deserialize, Serialize, Clone, Eq, PartialEq)]
-enum PcbMessage<M: Message> {
+pub(crate) enum PcbMessage<M: Message> {
     #[serde(bound(deserialize = "M: Message"))]
     Gossip(sign::PublicKey, Signature, M),
     Subscribe,
 }
 
+#[allow(clippy::derive_hash_xor_eq)]
 impl<M: Message> Hash for PcbMessage<M> {
     fn hash<H: Hasher>(&self, h: &mut H) {
         match self {
