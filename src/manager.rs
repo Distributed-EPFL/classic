@@ -307,7 +307,7 @@ impl Sender {
 
     /// Get an `Iterator` of all known keys in this `Sender`.
     pub async fn keys(&self) -> Vec<PublicKey> {
-        self.connections.read().await.keys().map(|x| *x).collect()
+        self.connections.read().await.keys().copied().collect()
     }
 }
 
