@@ -297,11 +297,28 @@ impl Sender {
         &self,
         message: Arc<M>,
         keys: I,
-    ) {
-        for key in keys {
-            if let Err(e) = self.send_to(key, message.clone()).await {
-                error!("send failure for {}: {}", key, e);
-            }
+    ) -> Option<Vec<SenderError>> {
+        let result = future::join_all(keys.map(|x| {
+            let message = message.clone();
+            async move { self.send_to(x, message).await }
+        }))
+        .await;
+
+        let result = result
+            .into_iter()
+            .filter_map(|x| {
+                if x.is_err() {
+                    Some(x.unwrap_err())
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+
+        if result.is_empty() {
+            None
+        } else {
+            Some(result)
         }
     }
 
