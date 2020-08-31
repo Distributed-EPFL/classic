@@ -306,13 +306,7 @@ impl Sender {
 
         let result = result
             .into_iter()
-            .filter_map(|x| {
-                if x.is_err() {
-                    Some(x.unwrap_err())
-                } else {
-                    None
-                }
-            })
+            .filter_map(|x| x.err())
             .collect::<Vec<_>>();
 
         if result.is_empty() {
