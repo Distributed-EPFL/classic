@@ -22,6 +22,9 @@ pub use connection::{ConnectionError, ConnectionHandle};
 mod manager;
 pub use manager::{Processor, Sender, SystemManager};
 
+mod sampler;
+pub use sampler::Sampler;
+
 #[cfg(test)]
 pub mod test;
 
