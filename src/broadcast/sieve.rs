@@ -1,11 +1,12 @@
-use std::collections::HashSet;
+use std::collections::hash_map::Entry;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::ops::Deref;
 use std::sync::Arc;
 
 use super::probabilistic::{PcbMessage, Probabilistic, ProbabilisticHandle};
-use crate::{Message, Processor, Sender};
+use crate::{Message, Processor, Sampler, Sender};
 
 use drop::async_trait;
 use drop::crypto::key::exchange::PublicKey;
@@ -20,11 +21,16 @@ use tokio::sync::{mpsc, Mutex, RwLock};
 use tracing::{debug, error};
 
 #[derive(Snafu, Debug)]
+/// Type of errors returned by `SieveHandle`
 pub enum SieveError {
     #[snafu(display("this handle is not a sender handle"))]
+    /// Tried to call `SieveHandle::broadcast` on an instance created using
+    /// `Sieve::new_receiver`
     NotASender,
 
     #[snafu(display("the associated sender died too early"))]
+    /// The associated `Sieve` instance does not exist anymore, and the
+    /// message couldn't be broadcasted
     SenderDied,
 }
 
@@ -47,8 +53,16 @@ impl<M: Message> Hash for PdeMessage<M> {
 }
 
 impl<M: Message> fmt::Debug for PdeMessage<M> {
-    fn fmt(&self, _f: &mut fmt::Formatter) -> fmt::Result {
-        todo!()
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            PdeMessage::EchoSubscribe => write!(f, "sieve echo subscribe"),
+            PdeMessage::Probabilistic(msg) => {
+                write!(f, "murmur message {:?}", msg)
+            }
+            PdeMessage::Echo(_, msg, _) => {
+                write!(f, "sieve echo message {:?}", msg)
+            }
+        }
     }
 }
 
@@ -56,20 +70,23 @@ impl<M: Message> Message for PdeMessage<M> {}
 
 impl<M: Message> Message for (M, Signature) {}
 
-/// An implementation of probabilistic double echo
-/// broadcast.
+/// An implementation of the `Sieve` probabilistic consistent broadcast
+/// algorithm. `Sieve` is a single-shot shot broadcast algorithm using
+/// a designated sender for each instance.
 pub struct Sieve<M: Message + 'static> {
-    deliverer: Option<mpsc::Sender<M>>,
+    deliverer: Mutex<Option<mpsc::Sender<M>>>,
     sender: sign::PublicKey,
     keypair: Arc<KeyPair>,
 
+    expected: usize,
+
     echo: Mutex<Option<(M, Signature)>>,
     echo_set: RwLock<HashSet<PublicKey>>,
-    echo_replies: RwLock<HashSet<PublicKey>>,
+    echo_replies: RwLock<HashMap<PublicKey, (M, Signature)>>,
     echo_threshold: usize,
 
     probabilistic: Arc<Probabilistic<(M, Signature)>>,
-    handle: Option<ProbabilisticHandle<(M, Signature)>>,
+    handle: Mutex<Option<ProbabilisticHandle<(M, Signature)>>>,
 }
 
 impl<M: Message> Sieve<M> {
@@ -93,20 +110,21 @@ impl<M: Message> Sieve<M> {
 
         Self {
             sender,
-            deliverer: None,
+            deliverer: Mutex::new(None),
             keypair,
+            expected: pb_size,
 
             echo: Mutex::new(None),
             echo_threshold,
             echo_set: RwLock::new(HashSet::with_capacity(pb_size)),
-            echo_replies: RwLock::new(HashSet::with_capacity(echo_threshold)),
+            echo_replies: RwLock::new(HashMap::with_capacity(echo_threshold)),
 
             probabilistic: Arc::new(probabilistic),
-            handle: None,
+            handle: Mutex::new(None),
         }
     }
 
-    /// Create a new double echo receiver.
+    /// Create a new `Sieve` receiver.
     pub fn new_sender(
         keypair: Arc<KeyPair>,
         echo_threshold: usize,
@@ -117,15 +135,16 @@ impl<M: Message> Sieve<M> {
         Self {
             sender: keypair.public().clone(),
             keypair,
-            deliverer: None,
+            deliverer: Mutex::new(None),
+            expected: pb_size,
 
             echo: Mutex::new(None),
             echo_threshold,
             echo_set: RwLock::new(HashSet::with_capacity(pb_size)),
-            echo_replies: RwLock::new(HashSet::with_capacity(echo_threshold)),
+            echo_replies: RwLock::new(HashMap::with_capacity(echo_threshold)),
 
             probabilistic: Arc::new(probabilistic),
-            handle: None,
+            handle: Mutex::new(None),
         }
     }
 
@@ -133,21 +152,32 @@ impl<M: Message> Sieve<M> {
         from: PublicKey,
         signature: &Signature,
         message: &M,
-        set: &RwLock<HashSet<PublicKey>>,
+        set: &RwLock<HashMap<PublicKey, (M, Signature)>>,
         delivered: &Mutex<Option<(M, Signature)>>,
         threshold: usize,
     ) -> bool {
         if let Some((recv_message, recv_signature)) =
             delivered.lock().await.deref()
         {
-            if recv_signature != signature || recv_message != message {
-                return false;
-            } else {
-                set.write().await.insert(from);
+            if recv_signature == signature && recv_message == message {
+                debug!("registered correct echo from {}", from);
+                match set.write().await.entry(from) {
+                    Entry::Occupied(_) => return false,
+                    Entry::Vacant(e) => {
+                        e.insert((message.clone(), *signature));
+                    }
+                }
             }
         }
 
-        set.read().await.len() >= threshold
+        set.read()
+            .await
+            .values()
+            .filter(|(stored_message, stored_signature)| {
+                stored_message == message && stored_signature == signature
+            })
+            .count()
+            >= threshold
     }
 
     async fn check_echo_set(
@@ -190,29 +220,28 @@ impl<M: Message> Processor<PdeMessage<M>, M> for Sieve<M> {
             PdeMessage::Echo(pkey, message, signature)
                 if *pkey == self.sender =>
             {
+                debug!("echo message from {}", from);
                 let mut signer = self.signer();
 
                 if signer.verify(signature, pkey, message).is_ok()
                     && self.check_echo_set(from, signature, message).await
                 {
-                    let message = PdeMessage::Echo(
-                        pkey.clone(),
-                        message.clone(),
-                        *signature,
-                    );
-
-                    sender
-                        .send_many(
-                            Arc::new(message),
-                            self.echo_set.read().await.iter(),
-                        )
-                        .await;
+                    debug!("reached delivery threshold");
+                    if let Some(mut sender) = self.deliverer.lock().await.take()
+                    {
+                        if sender.send(message.clone()).await.is_err() {
+                            error!("handle doesn't exist anymore for delivery");
+                        }
+                    } else {
+                        debug!("already delivered a message");
+                    }
                 }
             }
             PdeMessage::EchoSubscribe => {
                 if let Some((message, signature)) =
                     self.echo.lock().await.deref()
                 {
+                    debug!("echo subscription from {}", from);
                     let message = PdeMessage::Echo(
                         self.sender.clone(),
                         message.clone(),
@@ -230,7 +259,21 @@ impl<M: Message> Processor<PdeMessage<M>, M> for Sieve<M> {
             }
 
             PdeMessage::Probabilistic(msg) => {
+                debug!("processing murmur message {:?}", msg);
                 self.probabilistic.clone().process(msg, from, sender).await;
+
+                let mut guard = self.handle.lock().await;
+
+                if let Some(mut handle) = guard.take() {
+                    if let Some((message, signature)) = handle.try_deliver() {
+                        debug!("delivered {:?} using murmur", message);
+                        *self.echo.lock().await = Some((message, signature));
+                    } else {
+                        guard.replace(handle);
+                    }
+                } else {
+                    debug!("late message for probabilistic broadcast");
+                }
             }
 
             e => debug!("ignoring {:?}", e),
@@ -240,14 +283,32 @@ impl<M: Message> Processor<PdeMessage<M>, M> for Sieve<M> {
     async fn output(&mut self, sender: Arc<Sender>) -> Self::Handle {
         let (outgoing_tx, _outgoing_rx) = mpsc::channel(1);
         let (incoming_tx, incoming_rx) = mpsc::channel(1);
+        let sampler = Sampler::new(sender.clone());
+        let subscribe_sender = sender.clone();
 
         let handle = Arc::get_mut(&mut self.probabilistic)
             .expect("setup error")
             .output(sender)
             .await;
 
-        self.handle.replace(handle);
-        self.deliverer.replace(incoming_tx);
+        debug!("sampling for echo set");
+
+        let sample = sampler
+            .sample(self.expected)
+            .await
+            .expect("sampling failed");
+
+        self.echo_set.write().await.extend(sample);
+
+        subscribe_sender
+            .send_many(
+                Arc::new(PdeMessage::<M>::EchoSubscribe),
+                self.echo_set.read().await.iter(),
+            )
+            .await;
+
+        self.handle.lock().await.replace(handle);
+        self.deliverer.lock().await.replace(incoming_tx);
 
         let outgoing_tx = if self.sender == *self.keypair.public() {
             Some(outgoing_tx)
@@ -279,16 +340,17 @@ impl<M: Message> SieveHandle<M> {
             outgoing,
         }
     }
-    /// Deliver a `Message` using probabilistic double echo.
-    /// Value receiver prevents double use of this Handle since the primitive is
-    /// one-shot
+    /// Deliver a `Message` using the `Sieve` algorithm. Since `Sieve` is a
+    /// one-shot algorithm, a `SieveHandle` can only deliver one message.
+    /// All subsequent calls to this method will return `None`.
     pub async fn deliver(&mut self) -> Option<M> {
         self.incoming.recv().await
     }
 
-    /// Broadcast a message using the associated `ProbabilisticDoubleEcho`.
+    /// Broadcast a message using the associated `Sieve` instance. <br />
     /// This will return an error if the `Sieve` was created using
-    /// `Sieve::new_receiver`
+    /// `Sieve::new_receiver` or if this is not the first time this method is
+    /// called
     pub async fn broadcast(&mut self, message: M) -> Result<(), SieveError> {
         let mut sender = self.outgoing.take().context(NotASender)?;
         let signature =
@@ -308,9 +370,72 @@ impl<M: Message> SieveHandle<M> {
 
 #[cfg(test)]
 mod test {
+    use super::*;
+
+    use crate::test::*;
+    use crate::SystemManager;
+
+    const SIZE: usize = 50;
+    const MESSAGE: usize = 0;
+
     #[tokio::test]
     async fn delivery() {
-        todo!()
+        let keypair = KeyPair::random();
+        let sender_keypair = KeyPair::random();
+        let sender_pkey = sender_keypair.public().clone();
+        let orig_signature = Signer::new(sender_keypair.clone())
+            .sign(&MESSAGE)
+            .expect("failed to sign");
+        let echo_message =
+            PdeMessage::Echo(sender_pkey, MESSAGE, orig_signature);
+
+        let (_, handle, system) = create_system(SIZE, move |mut connection| {
+            let echo_message = echo_message.clone();
+
+            async move {
+                while let Ok(message) =
+                    connection.receive::<PdeMessage<usize>>().await
+                {
+                    match message {
+                        PdeMessage::EchoSubscribe => {
+                            connection
+                                .send(&echo_message)
+                                .await
+                                .expect("send failed");
+                        }
+                        PdeMessage::Echo(_, message, signature) => {
+                            assert_eq!(
+                                message, MESSAGE,
+                                "wrong message echoed"
+                            );
+                            assert_eq!(
+                                signature, orig_signature,
+                                "wrong signature"
+                            );
+                        }
+                        PdeMessage::Probabilistic(_) => unreachable!(),
+                    }
+                }
+            }
+        })
+        .await;
+        let manager = SystemManager::new(system);
+
+        let sieve = Sieve::new_receiver(
+            sender_keypair.public().clone(),
+            Arc::new(keypair),
+            SIZE / 4,
+            SIZE / 2,
+        );
+
+        let mut sieve = manager.run(sieve).await;
+
+        let message: usize =
+            sieve.deliver().await.expect("no message delivered");
+
+        assert_eq!(MESSAGE, message, "wrong message delivered");
+
+        handle.await.expect("system failure");
     }
 
     #[tokio::test]
