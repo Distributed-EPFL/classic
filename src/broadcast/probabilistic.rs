@@ -234,6 +234,16 @@ impl<M: Message + 'static> ProbabilisticHandle<M> {
         }
     }
 
+    /// Check to see if a message is available to delivered using this handle.
+    /// Returns `None` if no message is available right now.
+    pub fn try_deliver(&mut self) -> Option<M> {
+        if let Some(message) = self.delivery.borrow().deref() {
+            Some(message.clone())
+        } else {
+            None
+        }
+    }
+
     /// Broadcast a `Message` using the associated probabilistic broadcast
     /// instance. This will consume the `Handle` since this primitive is a
     /// one-shot.
