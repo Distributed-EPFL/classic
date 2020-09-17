@@ -413,7 +413,12 @@ mod test {
                                 "wrong signature"
                             );
                         }
-                        PdeMessage::Probabilistic(_) => unreachable!(),
+                        PdeMessage::Probabilistic(msg) => {
+                            connection
+                                .send(&PdeMessage::Probabilistic(msg))
+                                .await
+                                .expect("send failed");
+                        }
                     }
                 }
             }
