@@ -2,10 +2,11 @@ use std::env;
 use std::future::Future;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::Arc;
 
-use crate::System;
+use crate::{Message, Processor, System};
 
-use drop::crypto::key::exchange::{Exchanger, PublicKey};
+use drop::crypto::key::exchange::{Exchanger, KeyPair, PublicKey};
 use drop::net::{Connection, Listener, TcpConnector, TcpListener};
 
 use futures::future;
@@ -110,4 +111,51 @@ pub async fn create_system<
         handle,
         System::new_with_connector_zipped(&tcp, output).await,
     )
+}
+
+/// A `SystemManager` that uses a set sequence of messages for testing
+pub struct DummyManager<M> {
+    messages: Vec<(PublicKey, M)>,
+}
+
+impl<M: Message> DummyManager<M> {
+    /// Create a new `DummyManager` that will deliver the set of given messages
+    /// from randomly generated `PublicKey`s
+    pub fn new<I: IntoIterator<Item = M>>(messages: I) -> Self {
+        Self::new_with_key(
+            messages
+                .into_iter()
+                .map(|x| (*KeyPair::random().public(), x)),
+        )
+    }
+
+    /// Create a `DummyManager` that will deliver from a specified set of
+    /// `PublicKey`
+    pub fn new_with_key<I: IntoIterator<Item = (PublicKey, M)>>(
+        messages: I,
+    ) -> Self {
+        Self {
+            messages: messages.into_iter().collect(),
+        }
+    }
+
+    /// Run a `Processor` using the sequence of message specified at creation
+    pub async fn run<O: Message, P: Processor<M, O>>(
+        &self,
+        mut processor: P,
+    ) -> P::Handle {
+        let handle = processor.output(todo!()).await;
+        let processor = Arc::new(processor);
+
+        future::join_all(self.messages.into_iter().map(|(key, msg)| {
+            let p = processor.clone();
+
+            // FIXME: test sender require here
+            task::spawn(async move {
+                p.process(&msg, key).await;
+            })
+        }));
+
+        handle
+    }
 }
