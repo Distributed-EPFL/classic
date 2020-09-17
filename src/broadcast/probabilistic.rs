@@ -18,7 +18,8 @@ use peroxide::fuga::*;
 
 use tokio::sync::{mpsc, watch, Mutex, RwLock};
 
-use tracing::{debug, error};
+use tracing::{debug, debug_span, error};
+use tracing_futures::Instrument;
 
 #[derive(Snafu, Debug)]
 /// Error type returned by `Probablistic` broadcast instances
@@ -189,14 +190,17 @@ impl<M: Message + 'static> Processor<PcbMessage<M>, M> for Probabilistic<M> {
 
         let gossip = self.gossip.clone();
 
-        tokio::task::spawn(async move {
-            let sender = msg_sender;
-            let gossip = gossip;
+        tokio::task::spawn(
+            async move {
+                let sender = msg_sender;
+                let gossip = gossip;
 
-            if let Some(out) = receiver.recv().await {
-                sender.send_many(out, gossip.read().await.iter()).await;
+                if let Some(out) = receiver.recv().await {
+                    sender.send_many(out, gossip.read().await.iter()).await;
+                }
             }
-        });
+            .instrument(debug_span!("murmur_gossip")),
+        );
 
         let delivery = self
             .delivery
