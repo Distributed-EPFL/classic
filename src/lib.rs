@@ -20,7 +20,10 @@ mod connection;
 pub use connection::{ConnectionError, ConnectionHandle};
 
 mod manager;
-pub use manager::{Processor, Sender, SystemManager};
+pub use manager::{
+    CollectingSender, Processor, Sender, SenderError, SystemManager,
+    WrappingSender,
+};
 
 mod sampler;
 pub use sampler::Sampler;

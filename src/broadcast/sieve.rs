@@ -6,7 +6,7 @@ use std::ops::Deref;
 use std::sync::Arc;
 
 use super::probabilistic::{PcbMessage, Probabilistic, ProbabilisticHandle};
-use crate::{Message, Processor, Sampler, Sender};
+use crate::{Message, Processor, Sampler, Sender, WrappingSender};
 
 use drop::async_trait;
 use drop::crypto::key::exchange::PublicKey;
@@ -207,16 +207,20 @@ impl<M: Message> Sieve<M> {
 }
 
 #[async_trait]
-impl<M: Message> Processor<PdeMessage<M>, M> for Sieve<M> {
+impl<M, S> Processor<PdeMessage<M>, M, S> for Sieve<M>
+where
+    S: Sender<PdeMessage<M>> + 'static,
+    M: Message + 'static,
+{
     type Handle = SieveHandle<M>;
 
     async fn process(
         self: Arc<Self>,
-        message: &PdeMessage<M>,
+        message: Arc<PdeMessage<M>>,
         from: PublicKey,
-        sender: Arc<Sender>,
+        sender: Arc<S>,
     ) {
-        match message {
+        match message.deref() {
             PdeMessage::Echo(pkey, message, signature)
                 if *pkey == self.sender =>
             {
@@ -248,8 +252,7 @@ impl<M: Message> Processor<PdeMessage<M>, M> for Sieve<M> {
                         *signature,
                     );
 
-                    if let Err(e) =
-                        sender.send_to(&from, Arc::new(message)).await
+                    if let Err(e) = sender.send(Arc::new(message), &from).await
                     {
                         error!("failed to echo message to {}: {}", from, e);
                     }
@@ -260,7 +263,19 @@ impl<M: Message> Processor<PdeMessage<M>, M> for Sieve<M> {
 
             PdeMessage::Probabilistic(msg) => {
                 debug!("processing murmur message {:?}", msg);
-                self.probabilistic.clone().process(msg, from, sender).await;
+
+                let murmur_sender = WrappingSender::new(
+                    sender.clone(),
+                    |msg: &PcbMessage<(M, Signature)>| {
+                        Ok(PdeMessage::Probabilistic(msg.clone()))
+                    },
+                );
+                let murmur_sender = Arc::new(murmur_sender);
+
+                self.probabilistic
+                    .clone()
+                    .process(Arc::new(msg.clone()), from, murmur_sender)
+                    .await;
 
                 let mut guard = self.handle.lock().await;
 
@@ -274,21 +289,28 @@ impl<M: Message> Processor<PdeMessage<M>, M> for Sieve<M> {
                 } else {
                     debug!("late message for probabilistic broadcast");
                 }
+                todo!()
             }
 
             e => debug!("ignoring {:?}", e),
         }
     }
 
-    async fn output(&mut self, sender: Arc<Sender>) -> Self::Handle {
+    async fn output(&mut self, sender: Arc<S>) -> Self::Handle {
         let (outgoing_tx, _outgoing_rx) = mpsc::channel(1);
         let (incoming_tx, incoming_rx) = mpsc::channel(1);
         let sampler = Sampler::new(sender.clone());
         let subscribe_sender = sender.clone();
 
+        let murmur_sender = WrappingSender::new(
+            sender.clone(),
+            |msg: &PcbMessage<(M, Signature)>| {
+                Ok(PdeMessage::Probabilistic(msg.clone()))
+            },
+        );
         let handle = Arc::get_mut(&mut self.probabilistic)
             .expect("setup error")
-            .output(sender)
+            .output(Arc::new(murmur_sender))
             .await;
 
         debug!("sampling for echo set");
@@ -378,6 +400,7 @@ mod test {
     const SIZE: usize = 50;
     const MESSAGE: usize = 0;
 
+    #[ignore]
     #[tokio::test]
     async fn delivery() {
         let keypair = KeyPair::random();
@@ -444,7 +467,5 @@ mod test {
     }
 
     #[tokio::test]
-    async fn broadcast() {
-        todo!()
-    }
+    async fn broadcast() {}
 }

@@ -121,16 +121,18 @@ impl<M: Message + 'static> Probabilistic<M> {
 }
 
 #[async_trait]
-impl<M: Message + 'static> Processor<PcbMessage<M>, M> for Probabilistic<M> {
+impl<M: Message + 'static, S: Sender<PcbMessage<M>> + 'static>
+    Processor<PcbMessage<M>, M, S> for Probabilistic<M>
+{
     type Handle = ProbabilisticHandle<M>;
 
     async fn process(
         self: Arc<Self>,
-        message: &PcbMessage<M>,
+        message: Arc<PcbMessage<M>>,
         from: PublicKey,
-        sender: Arc<Sender>,
+        sender: Arc<S>,
     ) {
-        match message {
+        match message.deref() {
             PcbMessage::Subscribe => {
                 debug!("new peer {} subscribed to us", from);
                 self.gossip.write().await.insert(from);
@@ -145,7 +147,8 @@ impl<M: Message + 'static> Processor<PcbMessage<M>, M> for Probabilistic<M> {
                         return;
                     }
 
-                    if signer.verify(&signature, pkey, content).is_ok() {
+                    if signer.verify(&signature, &pkey, content.deref()).is_ok()
+                    {
                         debug!("good signature for {:?}", message);
 
                         delivered.replace(content.clone());
@@ -160,16 +163,14 @@ impl<M: Message + 'static> Processor<PcbMessage<M>, M> for Probabilistic<M> {
 
                         let dest = self.gossip.read().await;
 
-                        sender
-                            .send_many(Arc::new(message.clone()), dest.iter())
-                            .await;
+                        sender.send_many(message, dest.iter()).await;
                     }
                 }
             }
         }
     }
 
-    async fn output(&mut self, msg_sender: Arc<Sender>) -> Self::Handle {
+    async fn output(&mut self, msg_sender: Arc<S>) -> Self::Handle {
         let (sender, mut receiver) = mpsc::channel(128);
         let keys = msg_sender.keys().await;
         let count = keys.len();

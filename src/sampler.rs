@@ -1,8 +1,9 @@
 use std::convert::TryInto;
+use std::marker::PhantomData;
 use std::num::TryFromIntError;
 use std::sync::Arc;
 
-use crate::Sender;
+use crate::{Message, Sender};
 
 use drop::crypto::key::exchange::PublicKey;
 
@@ -17,15 +18,19 @@ pub enum SampleError {
 }
 
 /// Struct used to sample a `Sender` to produce a set of `PublicKey`s
-pub struct Sampler {
-    sender: Arc<Sender>,
+pub struct Sampler<S, M> {
+    sender: Arc<S>,
+    _m: PhantomData<M>,
 }
 
-impl Sampler {
+impl<M: Message + 'static, S: Sender<M>> Sampler<S, M> {
     /// Create a new `Sampler` that will provide an easy way to produce a
     /// sample from the given `Sender`
-    pub fn new(sender: Arc<Sender>) -> Self {
-        Self { sender }
+    pub fn new(sender: Arc<S>) -> Self {
+        Self {
+            sender,
+            _m: PhantomData,
+        }
     }
 
     /// Sample the set of known peers to produce a set of keys of size

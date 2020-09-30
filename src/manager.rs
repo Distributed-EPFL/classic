@@ -12,7 +12,7 @@ use drop::net::{Connection, ConnectionRead, ConnectionWrite};
 use futures::future::{self, FutureExt};
 use futures::{Stream, StreamExt};
 
-use snafu::{OptionExt, ResultExt, Snafu};
+use snafu::{ensure, OptionExt, ResultExt, Snafu};
 
 use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio::task;
@@ -22,21 +22,23 @@ use tracing_futures::Instrument;
 
 #[async_trait]
 /// Trait used to process incoming messages from a `SystemManager`
-pub trait Processor<M: Message, O: Message>: Send + Sync {
+pub trait Processor<M: Message + 'static, O: Message, S: Sender<M>>:
+    Send + Sync
+{
     /// The handle used to send and receive messages from the `Processor`
     type Handle;
 
     /// Process an incoming message using this `Processor`
     async fn process(
         self: Arc<Self>,
-        message: &M,
+        message: Arc<M>,
         from: PublicKey,
-        sender: Arc<Sender>,
+        sender: Arc<S>,
     );
 
     /// Setup the `Processor` using the given sender map and returns a `Handle`
     /// for the user to use.
-    async fn output(&mut self, sender: Arc<Sender>) -> Self::Handle;
+    async fn output(&mut self, sender: Arc<S>) -> Self::Handle;
 }
 
 #[derive(Snafu, Debug)]
@@ -87,7 +89,7 @@ impl<M: Message + 'static> SystemManager<M> {
     /// sending messages. This will return a `Handle` that allows interaction
     /// with the `Processor`.
     pub async fn run<
-        P: Processor<M, O, Handle = H> + 'static,
+        P: Processor<M, O, NetworkSender<M>, Handle = H> + 'static,
         O: Message,
         H,
     >(
@@ -100,7 +102,7 @@ impl<M: Message + 'static> SystemManager<M> {
 
         debug!("setting up dispatcher...");
 
-        let sender = Arc::new(Sender::new(self.writes));
+        let sender = Arc::new(NetworkSender::new(self.writes));
         let sender_add = sender.clone();
         let mut incoming = self.incoming;
 
@@ -129,7 +131,7 @@ impl<M: Message + 'static> SystemManager<M> {
                         let processor = processor.clone();
 
                         task::spawn(async move {
-                            processor.process(&message, pkey, sender).await;
+                            processor.process(message, pkey, sender).await;
                         });
                     }
                     None => {
@@ -237,70 +239,32 @@ pub enum SenderError {
     ConnectionError,
 }
 
-/// A handle to send messages to other known processes
-pub struct Sender {
-    connections: RwLock<HashMap<PublicKey, Mutex<ConnectionWrite>>>,
-}
-
-impl Sender {
-    /// Create a new `Sender` from a `Vec` of `ConnectionWrite`
-    pub fn new<I: IntoIterator<Item = ConnectionWrite>>(writes: I) -> Self {
-        let connections = writes
-            .into_iter()
-            .map(|x| (*x.remote_pkey(), Mutex::new(x)))
-            .collect::<HashMap<_, _>>();
-
-        Self {
-            connections: RwLock::new(connections),
-        }
-    }
-
+#[async_trait]
+/// Trait used when sending messages out from `Processor`s.
+pub trait Sender<M: Message + 'static>: Send + Sync {
     /// Add a new `ConnectionWrite` to this `Sender`
-    pub async fn add_connection(&self, write: ConnectionWrite) {
-        if let Some(conn) = self
-            .connections
-            .write()
-            .await
-            .insert(*write.remote_pkey(), Mutex::new(write))
-        {
-            let pkey = *conn.lock().await.remote_pkey();
-            warn!("replaced connection to {}, messages may be dropped", pkey);
-        }
-    }
+    async fn add_connection(&self, write: ConnectionWrite);
 
-    /// Send a message to a single remote process
-    pub async fn send_to<M: Message>(
+    /// Get the keys of  peers known by this `Sender`
+    async fn keys(&self) -> Vec<PublicKey>;
+
+    /// Send a message to a given peer using this `Sender`
+    async fn send(
         &self,
-        pkey: &PublicKey,
         message: Arc<M>,
-    ) -> Result<(), SenderError> {
-        self.connections
-            .read()
-            .await
-            .get(pkey)
-            .context(NoSuchPeer)?
-            .lock()
-            .await
-            .send(message.deref())
-            .await
-            .map_err(|_| snafu::NoneError)
-            .context(ConnectionError)
-        // FIXME: error forwarding once drop has good errors
-    }
+        pkey: &PublicKey,
+    ) -> Result<(), SenderError>;
 
-    /// Send a message to many remote processes
-    pub async fn send_many<
-        'a,
-        I: Iterator<Item = &'a PublicKey>,
-        M: Message,
-    >(
-        &self,
+    /// Send the same message to many different peers.
+    async fn send_many<'a, I: Iterator<Item = &'a PublicKey> + Send>(
+        self: Arc<Self>,
         message: Arc<M>,
         keys: I,
     ) -> Option<Vec<SenderError>> {
         let result = future::join_all(keys.map(|x| {
             let message = message.clone();
-            async move { self.send_to(x, message).await }
+            let nself = self.clone();
+            async move { nself.send(message, &x).await }
         }))
         .await;
 
@@ -315,10 +279,176 @@ impl Sender {
             Some(result)
         }
     }
+}
+
+/// A handle to send messages to other known processes
+pub struct NetworkSender<M: Message> {
+    connections: RwLock<HashMap<PublicKey, Mutex<ConnectionWrite>>>,
+    _m: PhantomData<M>,
+}
+
+impl<M: Message> NetworkSender<M> {
+    /// Create a new `Sender` from a `Vec` of `ConnectionWrite`
+    pub fn new<I: IntoIterator<Item = ConnectionWrite>>(writes: I) -> Self {
+        let connections = writes
+            .into_iter()
+            .map(|x| (*x.remote_pkey(), Mutex::new(x)))
+            .collect::<HashMap<_, _>>();
+
+        Self {
+            connections: RwLock::new(connections),
+            _m: PhantomData,
+        }
+    }
 
     /// Get an `Iterator` of all known keys in this `Sender`.
     pub async fn keys(&self) -> Vec<PublicKey> {
         self.connections.read().await.keys().copied().collect()
+    }
+}
+
+#[async_trait]
+impl<M: Message + 'static> Sender<M> for NetworkSender<M> {
+    async fn send(
+        &self,
+        message: Arc<M>,
+        pkey: &PublicKey,
+    ) -> Result<(), SenderError> {
+        self.connections
+            .read()
+            .await
+            .get(pkey)
+            .context(NoSuchPeer)?
+            .lock()
+            .await
+            .send(message.deref())
+            .await
+            .map_err(|_| snafu::NoneError) // FIXME: once drop has erros merged
+            .context(ConnectionError)
+    }
+
+    /// Add a new `ConnectionWrite` to this `Sender`
+    async fn add_connection(&self, write: ConnectionWrite) {
+        if let Some(conn) = self
+            .connections
+            .write()
+            .await
+            .insert(*write.remote_pkey(), Mutex::new(write))
+        {
+            let pkey = *conn.lock().await.remote_pkey();
+            warn!("replaced connection to {}, messages may be dropped", pkey);
+        }
+    }
+
+    async fn keys(&self) -> Vec<PublicKey> {
+        self.connections
+            .read()
+            .await
+            .iter()
+            .map(|(key, _)| *key)
+            .collect()
+    }
+}
+
+/// A `Sender` that can be use to transform messages before passing them to
+/// an underlying `Sneder`.
+pub struct WrappingSender<F, I, O, S>
+where
+    I: Message + 'static,
+    O: Message + 'static,
+    S: Sender<O>,
+    F: Fn(&I) -> Result<O, SenderError>,
+{
+    sender: Arc<S>,
+    closure: F,
+    _i: PhantomData<I>,
+    _o: PhantomData<O>,
+}
+
+impl<F, I, O, S> WrappingSender<F, I, O, S>
+where
+    I: Message + 'static,
+    O: Message + 'static,
+    S: Sender<O>,
+    F: Fn(&I) -> Result<O, SenderError> + Send + Sync,
+{
+    /// Create a new `WrappingSender` that will pass each message through
+    /// the specified closure before passing it on to the underlying `Sender`
+    pub fn new(sender: Arc<S>, closure: F) -> Self {
+        Self {
+            closure,
+            sender,
+            _i: PhantomData,
+            _o: PhantomData,
+        }
+    }
+}
+
+#[async_trait]
+impl<F, I, O, S> Sender<I> for WrappingSender<F, I, O, S>
+where
+    I: Message + 'static,
+    O: Message + 'static,
+    S: Sender<O>,
+    F: Fn(&I) -> Result<O, SenderError> + Send + Sync,
+{
+    async fn send(
+        &self,
+        message: Arc<I>,
+        to: &PublicKey,
+    ) -> Result<(), SenderError> {
+        let new = (self.closure)(message.deref())
+            .map_err(|_| snafu::NoneError)
+            .context(ConnectionError)?;
+        self.sender.send(Arc::new(new), to).await
+    }
+
+    async fn add_connection(&self, write: ConnectionWrite) {
+        self.sender.add_connection(write).await
+    }
+
+    async fn keys(&self) -> Vec<PublicKey> {
+        self.sender.keys().await
+    }
+}
+
+/// A `Sender` that only collects messages instead of sending them
+pub struct CollectingSender<M: Message> {
+    messages: Mutex<Vec<(PublicKey, Arc<M>)>>,
+    keys: Vec<PublicKey>,
+}
+
+impl<M: Message> CollectingSender<M> {
+    /// Create a new `CollectingSender` using a specified set of `PublicKey`
+    /// destinations
+    pub fn new<I: IntoIterator<Item = PublicKey>>(keys: I) -> Self {
+        Self {
+            messages: Mutex::new(Vec::new()),
+            keys: keys.into_iter().collect(),
+        }
+    }
+}
+
+#[async_trait]
+impl<M: Message + 'static> Sender<M> for CollectingSender<M> {
+    async fn send(
+        &self,
+        message: Arc<M>,
+        key: &PublicKey,
+    ) -> Result<(), SenderError> {
+        ensure!(self.keys.contains(key), NoSuchPeer);
+
+        self.messages.lock().await.push((*key, message));
+
+        Ok(())
+    }
+
+    async fn add_connection(&self, _write: ConnectionWrite) {
+        todo!()
+    }
+
+    async fn keys(&self) -> Vec<PublicKey> {
+        todo!()
     }
 }
 
@@ -340,14 +470,14 @@ mod test {
         }
 
         #[async_trait]
-        impl Processor<usize, usize> for Dummy {
+        impl Processor<usize, usize, NetworkSender<usize>> for Dummy {
             type Handle = mpsc::Receiver<(PublicKey, usize)>;
 
             async fn process(
                 self: Arc<Self>,
-                message: &usize,
+                message: Arc<usize>,
                 key: PublicKey,
-                _sender: Arc<Sender>,
+                _sender: Arc<NetworkSender<usize>>,
             ) {
                 self.sender
                     .as_ref()
@@ -358,7 +488,10 @@ mod test {
                     .expect("channel failure");
             }
 
-            async fn output(&mut self, _sender: Arc<Sender>) -> Self::Handle {
+            async fn output(
+                &mut self,
+                _sender: Arc<NetworkSender<usize>>,
+            ) -> Self::Handle {
                 let (tx, rx) = mpsc::channel(128);
 
                 self.sender.replace(tx);

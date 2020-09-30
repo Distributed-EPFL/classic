@@ -1,12 +1,13 @@
 use std::env;
 use std::future::Future;
+use std::marker::PhantomData;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::Arc;
 
-use crate::{Message, Processor, System};
+use crate::{CollectingSender, Message, Processor, System};
 
-use drop::crypto::key::exchange::{Exchanger, KeyPair, PublicKey};
+use drop::crypto::key::exchange::{Exchanger, PublicKey};
 use drop::net::{Connection, Listener, TcpConnector, TcpListener};
 
 use futures::future;
@@ -114,48 +115,56 @@ pub async fn create_system<
 }
 
 /// A `SystemManager` that uses a set sequence of messages for testing
-pub struct DummyManager<M> {
-    messages: Vec<(PublicKey, M)>,
+pub struct DummyManager<M: Message, O: Message> {
+    incoming: Vec<(PublicKey, M)>,
+    sender: Arc<CollectingSender<M>>,
+    _o: PhantomData<O>,
 }
 
-impl<M: Message> DummyManager<M> {
-    /// Create a new `DummyManager` that will deliver the set of given messages
-    /// from randomly generated `PublicKey`s
-    pub fn new<I: IntoIterator<Item = M>>(messages: I) -> Self {
-        Self::new_with_key(
-            messages
-                .into_iter()
-                .map(|x| (*KeyPair::random().public(), x)),
-        )
-    }
-
+impl<M: Message + 'static, O: Message + 'static> DummyManager<M, O> {
     /// Create a `DummyManager` that will deliver from a specified set of
     /// `PublicKey`
-    pub fn new_with_key<I: IntoIterator<Item = (PublicKey, M)>>(
+    pub fn new_with_key<
+        I: IntoIterator<Item = (PublicKey, M)>,
+        I1: IntoIterator<Item = PublicKey>,
+    >(
         messages: I,
+        keys: I1,
     ) -> Self {
+        let keys = keys.into_iter();
+
         Self {
-            messages: messages.into_iter().collect(),
+            sender: Arc::new(CollectingSender::new(keys)),
+            incoming: messages.into_iter().collect(),
+            _o: PhantomData,
         }
     }
 
     /// Run a `Processor` using the sequence of message specified at creation
-    pub async fn run<O: Message, P: Processor<M, O>>(
+    pub async fn run<P: Processor<M, O, CollectingSender<M>> + 'static>(
         &self,
         mut processor: P,
     ) -> P::Handle {
-        let handle = processor.output(todo!()).await;
+        let handle = processor.output(Arc::clone(&self.sender)).await;
         let processor = Arc::new(processor);
 
-        future::join_all(self.messages.into_iter().map(|(key, msg)| {
-            let p = processor.clone();
+        future::join_all(self.incoming.clone().into_iter().map(
+            |(key, msg)| {
+                let p = processor.clone();
+                let sender = self.sender.clone();
+                let msg = Arc::new(msg);
 
-            // FIXME: test sender require here
-            task::spawn(async move {
-                p.process(&msg, key).await;
-            })
-        }));
+                task::spawn(async move {
+                    p.process(msg, key, sender).await;
+                })
+            },
+        ))
+        .await;
 
         handle
+    }
+
+    pub fn sender(&self) -> Arc<CollectingSender<M>> {
+        self.sender.clone()
     }
 }
