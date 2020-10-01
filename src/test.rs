@@ -14,7 +14,7 @@ use futures::future;
 
 use tokio::task::{self, JoinHandle};
 
-use tracing::{info, Level};
+use tracing::{info, trace, Level};
 use tracing_subscriber::FmtSubscriber;
 
 static PORT_OFFSET: AtomicU16 = AtomicU16::new(0);
@@ -124,7 +124,7 @@ pub struct DummyManager<M: Message, O: Message> {
 impl<M: Message + 'static, O: Message + 'static> DummyManager<M, O> {
     /// Create a `DummyManager` that will deliver from a specified set of
     /// `PublicKey`
-    pub fn new_with_key<
+    pub fn with_key<
         I: IntoIterator<Item = (PublicKey, M)>,
         I1: IntoIterator<Item = PublicKey>,
     >(
@@ -155,6 +155,7 @@ impl<M: Message + 'static, O: Message + 'static> DummyManager<M, O> {
                 let msg = Arc::new(msg);
 
                 task::spawn(async move {
+                    trace!("[{}] staring processing for {:?}", key, msg);
                     p.process(msg, key, sender).await;
                 })
             },
