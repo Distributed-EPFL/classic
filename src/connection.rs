@@ -581,12 +581,11 @@ mod test {
         .await
         .expect("failed to connect");
 
-        let connections =
-            (0usize..10).map(|_| connection.clone()).collect::<Vec<_>>();
+        let connections = (0usize..10).map(|_| connection.clone());
 
         start_tx.send(()).expect("start failed");
 
-        future::join_all(connections.into_iter().map(|mut c| async move {
+        future::join_all(connections.map(|mut c| async move {
             c.receive().await.expect("recv failed")
         }))
         .await

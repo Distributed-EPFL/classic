@@ -90,22 +90,20 @@ pub async fn create_system<
     init_logger();
     let tcp = TcpConnector::new(Exchanger::random());
     let mut addrs = test_addrs(size);
-    let mut public =
+    let public =
         create_receivers(addrs.clone().into_iter(), move |connection| {
             (closure)(connection)
         })
         .await;
-    let pkeys = public.iter().map(|x| x.0).collect::<Vec<_>>();
-    let handle = task::spawn(async move {
-        future::join_all(public.drain(..).map(|x| x.1))
-            .await
-            .drain(..)
-            .collect::<Result<Vec<_>, _>>()
-            .expect("connection closure failed");
-    });
-    let candidates_iter = pkeys.into_iter().zip(addrs.drain(..).map(|x| x.1));
-
+    let pkeys = public.iter().map(|x| x.0);
+    let candidates_iter = pkeys.zip(addrs.drain(..).map(|x| x.1));
     let output = candidates_iter.collect::<Vec<_>>();
+    let handle = task::spawn(async move {
+        future::join_all(public.into_iter().map(|x| x.1))
+            .await
+            .into_iter()
+            .for_each(|x| x.expect("connection failure"))
+    });
 
     (
         output.clone(),

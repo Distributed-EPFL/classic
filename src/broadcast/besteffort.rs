@@ -200,12 +200,12 @@ mod test {
                 .instrument(debug_span!("client", dest=%addr))
             })
             .await;
-        let pkeys = public.iter().map(|x| x.0).collect::<Vec<_>>();
-        let handles = public.drain(..).map(|x| x.1);
-        let candidates = pkeys.into_iter().zip(addrs.drain(..).map(|x| x.1));
-
+        let pkeys = public.iter().map(|x| x.0);
+        let candidates = pkeys.zip(addrs.drain(..).map(|x| x.1));
         let system: System =
             System::new_with_connector_zipped(&tcp, candidates).await;
+
+        let handles = public.drain(..).map(|x| x.1);
         let (mut sender, _) = BestEffort::with::<usize>(system);
 
         let errors = sender.broadcast(&0usize).await;
@@ -239,12 +239,12 @@ mod test {
             },
         )
         .await;
-        let pkeys = public.iter().map(|x| x.0).collect::<Vec<_>>();
-        let handles = public.drain(..).map(|x| x.1);
-        let candidates = pkeys.into_iter().zip(addrs.drain(..).map(|x| x.1));
-
+        let pkeys = public.iter().map(|x| x.0);
+        let candidates = pkeys.zip(addrs.drain(..).map(|x| x.1));
         let system: System =
             System::new_with_connector_zipped(&tcp, candidates).await;
+
+        let handles = public.drain(..).map(|x| x.1);
 
         let (_, mut receiver) = BestEffort::with::<usize>(system);
 

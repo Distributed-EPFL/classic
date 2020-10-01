@@ -133,23 +133,16 @@ mod test {
             addrs.clone().into_iter(),
             |mut connection| async move {
                 let data = DATA.fetch_add(1, Ordering::AcqRel);
-                let mut received = Vec::new();
+                let mut count = 0;
                 connection.send(&data).await.expect("failed to send");
 
                 for _ in 0..(SIZE - 1) {
-                    let integer =
+                    let _: usize =
                         connection.receive().await.expect("recv failed");
 
-                    received.push(integer);
+                    count += 1;
                 }
-                assert_eq!(
-                    received.len(),
-                    SIZE - 1,
-                    "wrong number of messages"
-                );
-                (0..SIZE).filter(|x| *x != data).for_each(|x| {
-                    assert!(received.contains(&x));
-                })
+                assert_eq!(count, SIZE - 1, "wrong number of messages");
             },
         )
         .await;
@@ -193,7 +186,7 @@ mod test {
             received.push(data);
         }
 
-        received.sort();
+        received.sort_unstable();
 
         assert_eq!(
             received,
