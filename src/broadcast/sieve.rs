@@ -1,7 +1,6 @@
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
-use std::fmt;
-use std::hash::{Hash, Hasher};
+use std::hash::Hash;
 use std::ops::Deref;
 use std::sync::Arc;
 
@@ -18,7 +17,7 @@ use snafu::{OptionExt, ResultExt, Snafu};
 
 use tokio::sync::{mpsc, Mutex, RwLock};
 
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 
 #[derive(Snafu, Debug)]
 /// Type of errors returned by `SieveHandle`
@@ -34,36 +33,15 @@ pub enum SieveError {
     SenderDied,
 }
 
-#[derive(Clone, Eq, PartialEq, Deserialize, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Hash, Serialize)]
 /// Type of message exchanged for probabilistic double echo
 enum PdeMessage<M: Message> {
     #[serde(bound(deserialize = "M: Message"))]
     Probabilistic(PcbMessage<(M, Signature)>),
     #[serde(bound(deserialize = "M: Message"))]
-    Echo(sign::PublicKey, M, Signature),
+    Echo(M, Signature),
     /// Subscribe to the `Echo` set of a remote peer
     EchoSubscribe,
-}
-
-#[allow(clippy::derive_hash_xor_eq)]
-impl<M: Message> Hash for PdeMessage<M> {
-    fn hash<H: Hasher>(&self, _hasher: &mut H) {
-        todo!()
-    }
-}
-
-impl<M: Message> fmt::Debug for PdeMessage<M> {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            PdeMessage::EchoSubscribe => write!(f, "sieve echo subscribe"),
-            PdeMessage::Probabilistic(msg) => {
-                write!(f, "murmur message {:?}", msg)
-            }
-            PdeMessage::Echo(_, msg, _) => {
-                write!(f, "sieve echo message {:?}", msg)
-            }
-        }
-    }
 }
 
 impl<M: Message> Message for PdeMessage<M> {}
@@ -148,54 +126,54 @@ impl<M: Message> Sieve<M> {
         }
     }
 
-    async fn check_set(
-        from: PublicKey,
-        signature: &Signature,
-        message: &M,
-        set: &RwLock<HashMap<PublicKey, (M, Signature)>>,
-        delivered: &Mutex<Option<(M, Signature)>>,
-        threshold: usize,
-    ) -> bool {
-        if let Some((recv_message, recv_signature)) =
-            delivered.lock().await.deref()
-        {
-            if recv_signature == signature && recv_message == message {
-                debug!("registered correct echo from {}", from);
-                match set.write().await.entry(from) {
-                    Entry::Occupied(_) => return false,
-                    Entry::Vacant(e) => {
-                        e.insert((message.clone(), *signature));
-                    }
-                }
-            }
-        }
-
-        set.read()
+    async fn check_echo_set(&self, signature: &Signature, message: &M) -> bool {
+        let count = self
+            .echo_replies
+            .read()
             .await
             .values()
             .filter(|(stored_message, stored_signature)| {
                 stored_message == message && stored_signature == signature
             })
-            .count()
-            >= threshold
+            .count();
+
+        if count >= self.echo_threshold {
+            debug!("reached delivery threshold, checking correctness");
+
+            if let Some((recv_msg, recv_signature)) = &*self.echo.lock().await {
+                if recv_msg == message && recv_signature == signature {
+                    true
+                } else {
+                    warn!("mismatched message received");
+                    false
+                }
+            } else {
+                false
+            }
+        } else {
+            debug!(
+                "still waiting for {} messages",
+                self.echo_threshold - count
+            );
+            false
+        }
     }
 
-    async fn check_echo_set(
+    async fn update_echo_set(
         &self,
         from: PublicKey,
         signature: &Signature,
         message: &M,
     ) -> bool {
         if self.echo_set.read().await.contains(&from) {
-            Self::check_set(
-                from,
-                signature,
-                message,
-                &self.echo_replies,
-                &self.echo,
-                self.echo_threshold,
-            )
-            .await
+            match self.echo_replies.write().await.entry(from) {
+                Entry::Occupied(_) => false,
+                Entry::Vacant(e) => {
+                    debug!("registered correct echo message from {}", from);
+                    e.insert((message.clone(), *signature));
+                    true
+                }
+            }
         } else {
             false
         }
@@ -221,16 +199,14 @@ where
         sender: Arc<S>,
     ) {
         match message.deref() {
-            PdeMessage::Echo(pkey, message, signature)
-                if *pkey == self.sender =>
-            {
+            PdeMessage::Echo(message, signature) => {
                 debug!("echo message from {}", from);
                 let mut signer = self.signer();
 
-                if signer.verify(signature, pkey, message).is_ok()
-                    && self.check_echo_set(from, signature, message).await
+                if signer.verify(signature, &self.sender, message).is_ok()
+                    && self.update_echo_set(from, signature, message).await
+                    && self.check_echo_set(signature, message).await
                 {
-                    debug!("reached delivery threshold");
                     if let Some(mut sender) = self.deliverer.lock().await.take()
                     {
                         if sender.send(message.clone()).await.is_err() {
@@ -246,11 +222,7 @@ where
                     self.echo.lock().await.deref()
                 {
                     debug!("echo subscription from {}", from);
-                    let message = PdeMessage::Echo(
-                        self.sender.clone(),
-                        message.clone(),
-                        *signature,
-                    );
+                    let message = PdeMessage::Echo(message.clone(), *signature);
 
                     if let Err(e) = sender.send(Arc::new(message), &from).await
                     {
@@ -289,10 +261,7 @@ where
                 } else {
                     debug!("late message for probabilistic broadcast");
                 }
-                todo!()
             }
-
-            e => debug!("ignoring {:?}", e),
         }
     }
 
@@ -377,8 +346,7 @@ impl<M: Message> SieveHandle<M> {
         let mut sender = self.outgoing.take().context(NotASender)?;
         let signature =
             self.signer.sign(&message).expect("failed to sign message");
-        let message =
-            PdeMessage::Echo(self.signer.public().clone(), message, signature);
+        let message = PdeMessage::Echo(message, signature);
 
         sender
             .send(message)
@@ -395,75 +363,53 @@ mod test {
     use super::*;
 
     use crate::test::*;
-    use crate::SystemManager;
+
+    use drop::crypto::key::exchange;
 
     const SIZE: usize = 50;
     const MESSAGE: usize = 0;
 
-    #[ignore]
     #[tokio::test]
-    async fn delivery() {
+    async fn delivery_no_network() {
+        init_logger();
+
         let keypair = KeyPair::random();
-        let sender_keypair = KeyPair::random();
-        let sender_pkey = sender_keypair.public().clone();
-        let orig_signature = Signer::new(sender_keypair.clone())
-            .sign(&MESSAGE)
-            .expect("failed to sign");
-        let echo_message =
-            PdeMessage::Echo(sender_pkey, MESSAGE, orig_signature);
+        let sender = keypair.public().clone();
+        let mut signer = Signer::new(keypair.clone());
+        let orig_signature = signer.sign(&MESSAGE).expect("sign failed");
+        let message = (MESSAGE, orig_signature);
+        let signature = signer.sign(&message).expect("sign failed");
+        let gossip = (0..SIZE).map(|_| {
+            PdeMessage::Probabilistic(PcbMessage::Gossip(
+                sender.clone(),
+                signature,
+                message,
+            ))
+        });
+        let echos =
+            (0..SIZE).map(|_| PdeMessage::Echo(MESSAGE, orig_signature));
 
-        let (_, handle, system) = create_system(SIZE, move |mut connection| {
-            let echo_message = echo_message.clone();
+        let keys = (0..50)
+            .map(|_| *exchange::KeyPair::random().public())
+            .collect::<Vec<_>>();
+        let messages = keys
+            .iter()
+            .cloned()
+            .zip(gossip)
+            .chain(keys.iter().cloned().zip(echos));
 
-            async move {
-                while let Ok(message) =
-                    connection.receive::<PdeMessage<usize>>().await
-                {
-                    match message {
-                        PdeMessage::EchoSubscribe => {
-                            connection
-                                .send(&echo_message)
-                                .await
-                                .expect("send failed");
-                        }
-                        PdeMessage::Echo(_, message, signature) => {
-                            assert_eq!(
-                                message, MESSAGE,
-                                "wrong message echoed"
-                            );
-                            assert_eq!(
-                                signature, orig_signature,
-                                "wrong signature"
-                            );
-                        }
-                        PdeMessage::Probabilistic(msg) => {
-                            connection
-                                .send(&PdeMessage::Probabilistic(msg))
-                                .await
-                                .expect("send failed");
-                        }
-                    }
-                }
-            }
-        })
-        .await;
-        let manager = SystemManager::new(system);
+        let keypair = Arc::new(KeyPair::random());
+        let manager = DummyManager::with_key(messages, keys.clone());
 
-        let sieve = Sieve::new_receiver(
-            sender_keypair.public().clone(),
-            Arc::new(keypair),
-            SIZE / 4,
-            SIZE / 2,
-        );
+        // FIXME: saner parameters for sampling
+        let processor =
+            Sieve::new_receiver(sender.clone(), keypair, SIZE / 5, SIZE / 3);
 
-        let mut sieve = manager.run(sieve).await;
+        let mut handle = manager.run(processor).await;
 
-        let message: usize =
-            sieve.deliver().await.expect("no message delivered");
+        let message: usize = handle.deliver().await.expect("deliver failed");
 
-        assert_eq!(MESSAGE, message, "wrong message delivered");
-
-        handle.await.expect("system failure");
+        assert_eq!(message, MESSAGE, "wrong message delivered");
     }
 
     #[tokio::test]
