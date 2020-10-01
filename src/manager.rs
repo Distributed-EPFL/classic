@@ -448,7 +448,7 @@ impl<M: Message + 'static> Sender<M> for CollectingSender<M> {
     }
 
     async fn keys(&self) -> Vec<PublicKey> {
-        todo!()
+        self.keys.clone()
     }
 }
 
