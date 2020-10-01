@@ -530,7 +530,7 @@ mod test {
             messages.push(message);
         }
 
-        messages.sort();
+        messages.sort_unstable();
 
         assert_eq!(
             messages,
