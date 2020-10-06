@@ -350,6 +350,62 @@ impl<M: Message + 'static> Sender<M> for NetworkSender<M> {
     }
 }
 
+/// A `Sender` that uses an input messages type I and implements an output `Sender`
+/// using the `Into` trait
+pub struct ConvertSender<I, O, S>
+where
+    I: Message + 'static + Into<O>,
+    O: Message + 'static,
+    S: Sender<O>,
+{
+    sender: Arc<S>,
+    _i: PhantomData<I>,
+    _o: PhantomData<O>,
+}
+
+impl<I, O, S> ConvertSender<I, O, S>
+where
+    I: Message + 'static + Into<O>,
+    O: Message + 'static,
+    S: Sender<O>,
+{
+    /// Create a new `ConvertSender` using the provided underlying `Sender`
+    /// to actually send messages
+    pub fn new(sender: Arc<S>) -> Self {
+        Self {
+            sender,
+            _i: PhantomData,
+            _o: PhantomData,
+        }
+    }
+}
+
+#[async_trait]
+impl<I, O, S> Sender<I> for ConvertSender<I, O, S>
+where
+    I: Message + 'static + Into<O>,
+    O: Message + 'static,
+    S: Sender<O>,
+{
+    async fn send(
+        &self,
+        message: Arc<I>,
+        to: &PublicKey,
+    ) -> Result<(), SenderError> {
+        let message = message.deref().clone().into();
+
+        self.sender.send(Arc::new(message), to).await
+    }
+
+    async fn keys(&self) -> Vec<PublicKey> {
+        self.sender.keys().await
+    }
+
+    async fn add_connection(&self, write: ConnectionWrite) {
+        self.sender.add_connection(write).await
+    }
+}
+
 /// A `Sender` that can be use to transform messages before passing them to
 /// an underlying `Sneder`.
 pub struct WrappingSender<F, I, O, S>
