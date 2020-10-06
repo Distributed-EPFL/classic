@@ -5,7 +5,7 @@ use std::ops::Deref;
 use std::sync::Arc;
 
 use super::probabilistic::{PcbMessage, Probabilistic, ProbabilisticHandle};
-use crate::{Message, Processor, Sampler, Sender, WrappingSender};
+use crate::{ConvertSender, Message, Processor, Sampler, Sender};
 
 use drop::async_trait;
 use drop::crypto::key::exchange::PublicKey;
@@ -35,13 +35,19 @@ pub enum SieveError {
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Hash, Serialize)]
 /// Type of message exchanged for probabilistic double echo
-enum PdeMessage<M: Message> {
+pub(crate) enum PdeMessage<M: Message> {
     #[serde(bound(deserialize = "M: Message"))]
     Probabilistic(PcbMessage<(M, Signature)>),
     #[serde(bound(deserialize = "M: Message"))]
     Echo(M, Signature),
     /// Subscribe to the `Echo` set of a remote peer
     EchoSubscribe,
+}
+
+impl<M: Message> From<PcbMessage<(M, Signature)>> for PdeMessage<M> {
+    fn from(v: PcbMessage<(M, Signature)>) -> Self {
+        PdeMessage::Probabilistic(v)
+    }
 }
 
 impl<M: Message> Message for PdeMessage<M> {}
@@ -236,13 +242,8 @@ where
             PdeMessage::Probabilistic(msg) => {
                 debug!("processing murmur message {:?}", msg);
 
-                let murmur_sender = WrappingSender::new(
-                    sender.clone(),
-                    |msg: &PcbMessage<(M, Signature)>| {
-                        Ok(PdeMessage::Probabilistic(msg.clone()))
-                    },
-                );
-                let murmur_sender = Arc::new(murmur_sender);
+                let murmur_sender =
+                    Arc::new(ConvertSender::new(sender.clone()));
 
                 self.probabilistic
                     .clone()
@@ -271,15 +272,10 @@ where
         let sampler = Sampler::new(sender.clone());
         let subscribe_sender = sender.clone();
 
-        let murmur_sender = WrappingSender::new(
-            sender.clone(),
-            |msg: &PcbMessage<(M, Signature)>| {
-                Ok(PdeMessage::Probabilistic(msg.clone()))
-            },
-        );
+        let murmur_sender = Arc::new(ConvertSender::new(sender));
         let handle = Arc::get_mut(&mut self.probabilistic)
             .expect("setup error")
-            .output(Arc::new(murmur_sender))
+            .output(murmur_sender)
             .await;
 
         debug!("sampling for echo set");
@@ -369,25 +365,25 @@ mod test {
     const SIZE: usize = 50;
     const MESSAGE: usize = 0;
 
-    #[tokio::test]
-    async fn delivery_no_network() {
-        init_logger();
-
-        let keypair = KeyPair::random();
+    fn create_sieve_manager<T: Message + Copy + 'static>(
+        keypair: &KeyPair,
+        message: T,
+        peer_count: usize,
+    ) -> (DummyManager<PdeMessage<T>, T>, Signature) {
         let sender = keypair.public().clone();
         let mut signer = Signer::new(keypair.clone());
-        let orig_signature = signer.sign(&MESSAGE).expect("sign failed");
-        let message = (MESSAGE, orig_signature);
-        let signature = signer.sign(&message).expect("sign failed");
-        let gossip = (0..SIZE).map(|_| {
+        let orig_signature = signer.sign(&message).expect("sign failed");
+        let cmessage = (message, orig_signature);
+        let signature = signer.sign(&cmessage).expect("sign failed");
+        let gossip = (0..peer_count).map(|_| {
             PdeMessage::Probabilistic(PcbMessage::Gossip(
                 sender.clone(),
                 signature,
-                message,
+                cmessage,
             ))
         });
         let echos =
-            (0..SIZE).map(|_| PdeMessage::Echo(MESSAGE, orig_signature));
+            (0..peer_count).map(|_| PdeMessage::Echo(message, orig_signature));
 
         let keys = (0..50)
             .map(|_| *exchange::KeyPair::random().public())
@@ -398,12 +394,24 @@ mod test {
             .zip(gossip)
             .chain(keys.iter().cloned().zip(echos));
 
+        (DummyManager::with_key(messages, keys.clone()), signature)
+    }
+
+    #[tokio::test]
+    async fn delivery_no_network() {
+        init_logger();
+
+        let sender = Arc::new(KeyPair::random());
         let keypair = Arc::new(KeyPair::random());
-        let manager = DummyManager::with_key(messages, keys.clone());
+        let (manager, _) = create_sieve_manager(&sender, MESSAGE, SIZE);
 
         // FIXME: saner parameters for sampling
-        let processor =
-            Sieve::new_receiver(sender.clone(), keypair, SIZE / 5, SIZE / 3);
+        let processor = Sieve::new_receiver(
+            sender.public().clone(),
+            keypair,
+            SIZE / 5,
+            SIZE / 3,
+        );
 
         let mut handle = manager.run(processor).await;
 
@@ -413,5 +421,21 @@ mod test {
     }
 
     #[tokio::test]
-    async fn broadcast() {}
+    async fn broadcast_no_network() {
+        init_logger();
+
+        let keypair = KeyPair::random();
+        let (manager, _) = create_sieve_manager(&keypair, MESSAGE, SIZE);
+
+        let processor =
+            Sieve::new_sender(Arc::new(keypair), SIZE / 5, SIZE / 3);
+
+        let mut handle = manager.run(processor).await;
+
+        handle.broadcast(MESSAGE).await.expect("broadcast failed");
+
+        let message = handle.deliver().await.expect("deliver failed");
+
+        assert_eq!(message, MESSAGE, "wrong message delivered");
+    }
 }
