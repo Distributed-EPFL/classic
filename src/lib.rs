@@ -21,8 +21,8 @@ pub use connection::{ConnectionError, ConnectionHandle};
 
 mod manager;
 pub use manager::{
-    CollectingSender, Processor, Sender, SenderError, SystemManager,
-    WrappingSender,
+    CollectingSender, ConvertSender, Processor, Sender, SenderError,
+    SystemManager, WrappingSender,
 };
 
 mod sampler;
