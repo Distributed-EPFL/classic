@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use snafu::{OptionExt, ResultExt, Snafu};
 
 use tokio::sync::{mpsc, Mutex, RwLock};
+use tokio::task;
 
 use tracing::{debug, error, warn};
 
@@ -267,7 +268,7 @@ where
     }
 
     async fn output(&mut self, sender: Arc<S>) -> Self::Handle {
-        let (outgoing_tx, _outgoing_rx) = mpsc::channel(1);
+        let (outgoing_tx, mut outgoing_rx) = mpsc::channel(1);
         let (incoming_tx, incoming_rx) = mpsc::channel(1);
         let sampler = Sampler::new(sender.clone());
         let subscribe_sender = sender.clone();
@@ -298,6 +299,14 @@ where
         self.deliverer.lock().await.replace(incoming_tx);
 
         let outgoing_tx = if self.sender == *self.keypair.public() {
+            task::spawn(async move {
+                if let Some(msg) = outgoing_rx.recv().await {
+                    todo!("use murmur on {:?}", msg);
+                } else {
+                    error!("broadcast sender not used");
+                }
+            });
+
             Some(outgoing_tx)
         } else {
             None
@@ -365,7 +374,40 @@ mod test {
     const SIZE: usize = 50;
     const MESSAGE: usize = 0;
 
-    fn create_sieve_manager<T: Message + Copy + 'static>(
+    macro_rules! sieve_test {
+        ($message:expr, $count:expr) => {
+            init_logger();
+
+            let keypair = Arc::new(KeyPair::random());
+            let message = $message;
+            let sender = Arc::new(KeyPair::random());
+            let (manager, signature) =
+                create_sieve_manager(&sender, message.clone(), $count);
+
+            let processor = Sieve::new_receiver(
+                sender.public().clone(),
+                keypair.clone(),
+                SIZE / 5,
+                SIZE / 3,
+            );
+
+            let mut handle = manager.run(processor).await;
+
+            let received = handle.deliver().await.expect("deliver failed");
+
+            let mut signer = Signer::new(keypair.deref().clone());
+
+            assert_eq!(message, received, "wrong message delivered");
+            assert!(
+                signer
+                    .verify(&signature, sender.public(), &received)
+                    .is_ok(),
+                "bad signature"
+            );
+        };
+    }
+
+    fn create_sieve_manager<T: Message + Clone + 'static>(
         keypair: &KeyPair,
         message: T,
         peer_count: usize,
@@ -379,11 +421,11 @@ mod test {
             PdeMessage::Probabilistic(PcbMessage::Gossip(
                 sender.clone(),
                 signature,
-                cmessage,
+                cmessage.clone(),
             ))
         });
-        let echos =
-            (0..peer_count).map(|_| PdeMessage::Echo(message, orig_signature));
+        let echos = (0..peer_count)
+            .map(|_| PdeMessage::Echo(cmessage.0.clone(), orig_signature));
 
         let keys = (0..50)
             .map(|_| *exchange::KeyPair::random().public())
@@ -394,30 +436,38 @@ mod test {
             .zip(gossip)
             .chain(keys.iter().cloned().zip(echos));
 
-        (DummyManager::with_key(messages, keys.clone()), signature)
+        (
+            DummyManager::with_key(messages, keys.clone()),
+            orig_signature,
+        )
     }
 
     #[tokio::test]
-    async fn delivery_no_network() {
-        init_logger();
+    async fn deliver_vec_no_network() {
+        let msg = vec![0u64, 1, 2, 3, 4, 5, 6, 7];
 
-        let sender = Arc::new(KeyPair::random());
-        let keypair = Arc::new(KeyPair::random());
-        let (manager, _) = create_sieve_manager(&sender, MESSAGE, SIZE);
+        sieve_test!(msg, SIZE);
+    }
 
-        // FIXME: saner parameters for sampling
-        let processor = Sieve::new_receiver(
-            sender.public().clone(),
-            keypair,
-            SIZE / 5,
-            SIZE / 3,
-        );
+    #[tokio::test]
+    async fn delivery_usize_no_network() {
+        sieve_test!(0, SIZE);
+    }
 
-        let mut handle = manager.run(processor).await;
+    #[tokio::test]
+    async fn delivery_enum_no_network() {
+        #[derive(Debug, Clone, Eq, PartialEq, Hash, Serialize, Deserialize)]
+        enum T {
+            Ok,
+            Error,
+            Other,
+        }
 
-        let message: usize = handle.deliver().await.expect("deliver failed");
+        impl Message for T {}
 
-        assert_eq!(message, MESSAGE, "wrong message delivered");
+        let msg = T::Error;
+
+        sieve_test!(msg, SIZE);
     }
 
     #[tokio::test]
