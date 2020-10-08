@@ -140,25 +140,23 @@ impl<M: Message + 'static, O: Message + 'static> DummyManager<M, O> {
 
     /// Run a `Processor` using the sequence of message specified at creation
     pub async fn run<P: Processor<M, O, CollectingSender<M>> + 'static>(
-        &self,
+        self,
         mut processor: P,
     ) -> P::Handle {
         let handle = processor.output(Arc::clone(&self.sender)).await;
         let processor = Arc::new(processor);
+        let sender = self.sender;
 
-        future::join_all(self.incoming.clone().into_iter().map(
-            |(key, msg)| {
-                let p = processor.clone();
-                let sender = self.sender.clone();
-                let msg = Arc::new(msg);
+        self.incoming.into_iter().for_each(|(key, msg)| {
+            let p = processor.clone();
+            let sender = sender.clone();
+            let msg = Arc::new(msg);
 
-                task::spawn(async move {
-                    trace!("[{}] staring processing for {:?}", key, msg);
-                    p.process(msg, key, sender).await;
-                })
-            },
-        ))
-        .await;
+            task::spawn(async move {
+                trace!("[{}] staring processing for {:?}", key, msg);
+                p.process(msg, key, sender).await;
+            });
+        });
 
         handle
     }
