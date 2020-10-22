@@ -112,6 +112,12 @@ pub async fn create_system<
     )
 }
 
+pub(crate) fn keyset(count: usize) -> impl Iterator<Item = PublicKey> + Clone {
+    use drop::crypto::key::exchange::KeyPair;
+
+    (0..count).map(|_| *KeyPair::random().public())
+}
+
 /// A `SystemManager` that uses a set sequence of messages for testing
 pub struct DummyManager<M: Message, O: Message> {
     incoming: Vec<(PublicKey, M)>,
@@ -146,17 +152,26 @@ impl<M: Message + 'static, O: Message + 'static> DummyManager<M, O> {
         let handle = processor.output(Arc::clone(&self.sender)).await;
         let processor = Arc::new(processor);
         let sender = self.sender;
+        let total = self.incoming.len();
 
-        self.incoming.into_iter().for_each(|(key, msg)| {
-            let p = processor.clone();
-            let sender = sender.clone();
-            let msg = Arc::new(msg);
+        self.incoming
+            .into_iter()
+            .enumerate()
+            .for_each(|(idx, (key, msg))| {
+                let p = processor.clone();
+                let sender = sender.clone();
+                let msg = Arc::new(msg);
 
-            task::spawn(async move {
-                trace!("[{}] staring processing for {:?}", key, msg);
-                p.process(msg, key, sender).await;
+                task::spawn(async move {
+                    trace!(
+                        "[{}/{}] staring processing for {:?}",
+                        idx + 1,
+                        total,
+                        msg
+                    );
+                    p.process(msg, key, sender).await;
+                });
             });
-        });
 
         handle
     }
