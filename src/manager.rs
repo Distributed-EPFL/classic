@@ -483,6 +483,11 @@ impl<M: Message> CollectingSender<M> {
             keys: keys.into_iter().collect(),
         }
     }
+
+    /// Retrieve the set of messages that was sent using this `CollectingSender`
+    pub async fn messages(&self) -> Vec<(PublicKey, Arc<M>)> {
+        self.messages.lock().await.iter().cloned().collect()
+    }
 }
 
 #[async_trait]
