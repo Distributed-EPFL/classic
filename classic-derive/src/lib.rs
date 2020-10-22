@@ -30,7 +30,7 @@ pub fn message(
     let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
 
     let expanded = quote! {
-        #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+        #[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
         #def
 
         impl #impl_generics Message for #name #ty_generics #where_clause {}
