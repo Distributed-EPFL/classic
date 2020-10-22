@@ -7,6 +7,8 @@ use std::sync::Arc;
 use super::probabilistic::{PcbMessage, Probabilistic, ProbabilisticHandle};
 use crate::{ConvertSender, Message, Processor, Sampler, Sender};
 
+use classic_derive::message;
+
 use drop::async_trait;
 use drop::crypto::key::exchange::PublicKey;
 use drop::crypto::sign::{self, KeyPair, Signature, Signer};
@@ -34,8 +36,8 @@ pub enum SieveError {
     SenderDied,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Hash, Serialize)]
 /// Type of message exchanged for probabilistic double echo
+#[message]
 pub(crate) enum PdeMessage<M: Message> {
     #[serde(bound(deserialize = "M: Message"))]
     Probabilistic(PcbMessage<(M, Signature)>),
@@ -50,8 +52,6 @@ impl<M: Message> From<PcbMessage<(M, Signature)>> for PdeMessage<M> {
         PdeMessage::Probabilistic(v)
     }
 }
-
-impl<M: Message> Message for PdeMessage<M> {}
 
 impl<M: Message> Message for (M, Signature) {}
 
@@ -336,11 +336,19 @@ impl<M: Message> SieveHandle<M> {
             outgoing,
         }
     }
+
     /// Deliver a `Message` using the `Sieve` algorithm. Since `Sieve` is a
     /// one-shot algorithm, a `SieveHandle` can only deliver one message.
     /// All subsequent calls to this method will return `None`.
     pub async fn deliver(&mut self) -> Option<M> {
         self.incoming.recv().await
+    }
+
+    /// Attempts delivery of a `Message` using the `Sieve` algorithm.
+    /// This method returns `None` immediately if no `Message` is ready for
+    /// delivery
+    pub fn try_deliver(&mut self) -> Option<M> {
+        self.incoming.try_recv().ok()
     }
 
     /// Broadcast a message using the associated `Sieve` instance. <br />
@@ -364,12 +372,11 @@ impl<M: Message> SieveHandle<M> {
 }
 
 #[cfg(test)]
-mod test {
+pub(crate) mod test {
     use super::*;
 
+    use super::super::probabilistic::test::murmur_message_sequence;
     use crate::test::*;
-
-    use drop::crypto::key::exchange;
 
     const SIZE: usize = 50;
     const MESSAGE: usize = 0;
@@ -407,39 +414,58 @@ mod test {
         };
     }
 
+    /// Create a `DummyManager` that will deliver the correct sequence of
+    /// messages required for delivery of one sieve message
     fn create_sieve_manager<T: Message + Clone + 'static>(
         keypair: &KeyPair,
         message: T,
         peer_count: usize,
     ) -> (DummyManager<PdeMessage<T>, T>, Signature) {
-        let sender = keypair.public().clone();
         let mut signer = Signer::new(keypair.clone());
-        let orig_signature = signer.sign(&message).expect("sign failed");
-        let cmessage = (message, orig_signature);
-        let signature = signer.sign(&cmessage).expect("sign failed");
-        let gossip = (0..peer_count).map(|_| {
-            PdeMessage::Probabilistic(PcbMessage::Gossip(
-                sender.clone(),
-                signature,
-                cmessage.clone(),
-            ))
-        });
-        let echos = (0..peer_count)
-            .map(|_| PdeMessage::Echo(cmessage.0.clone(), orig_signature));
-
-        let keys = (0..50)
-            .map(|_| *exchange::KeyPair::random().public())
+        let signature = signer.sign(&message).expect("sign failed");
+        let echos = sieve_message_sequence(keypair, message, peer_count)
             .collect::<Vec<_>>();
+        let keys = keyset(peer_count).collect::<Vec<_>>();
         let messages = keys
             .iter()
+            .chain(keys.iter())
             .cloned()
-            .zip(gossip)
-            .chain(keys.iter().cloned().zip(echos));
+            .zip(echos)
+            .collect::<Vec<_>>();
 
-        (
-            DummyManager::with_key(messages, keys.clone()),
-            orig_signature,
+        (DummyManager::with_key(messages, keys), signature)
+    }
+
+    pub(crate) fn sieve_message_sequence<M: Message + 'static>(
+        keypair: &KeyPair,
+        message: M,
+        peer_count: usize,
+    ) -> impl Iterator<Item = PdeMessage<M>> {
+        let signature = Signer::new(keypair.clone())
+            .sign(&message)
+            .expect("sign failed");
+
+        let gossip = murmur_message_sequence(
+            (message.clone(), signature),
+            keypair,
+            peer_count,
         )
+        .map(PdeMessage::Probabilistic);
+
+        gossip.chain(
+            (0..peer_count)
+                .map(move |_| PdeMessage::Echo(message.clone(), signature)),
+        )
+    }
+
+    #[test]
+    fn sequence_generation() {
+        let keypair = KeyPair::random();
+        let message = 0usize;
+        let count = 25;
+        let messages = sieve_message_sequence(&keypair, message, count);
+
+        assert_eq!(messages.count(), count * 2);
     }
 
     #[tokio::test]
@@ -456,14 +482,12 @@ mod test {
 
     #[tokio::test]
     async fn delivery_enum_no_network() {
-        #[derive(Debug, Clone, Eq, PartialEq, Hash, Serialize, Deserialize)]
+        #[message]
         enum T {
             Ok,
             Error,
             Other,
         }
-
-        impl Message for T {}
 
         let msg = T::Error;
 
@@ -474,11 +498,11 @@ mod test {
     async fn broadcast_no_network() {
         init_logger();
 
-        let keypair = KeyPair::random();
-        let (manager, _) = create_sieve_manager(&keypair, MESSAGE, SIZE);
+        let keypair = Arc::new(KeyPair::random());
+        let (manager, signature) =
+            create_sieve_manager(&keypair, MESSAGE, SIZE);
 
-        let processor =
-            Sieve::new_sender(Arc::new(keypair), SIZE / 5, SIZE / 3);
+        let processor = Sieve::new_sender(keypair.clone(), SIZE / 5, SIZE / 3);
 
         let mut handle = manager.run(processor).await;
 
@@ -486,6 +510,9 @@ mod test {
 
         let message = handle.deliver().await.expect("deliver failed");
 
+        Signer::random()
+            .verify(&signature, keypair.public(), &MESSAGE)
+            .expect("bad signature");
         assert_eq!(message, MESSAGE, "wrong message delivered");
     }
 }
