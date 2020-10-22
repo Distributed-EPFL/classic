@@ -1,10 +1,10 @@
 use std::collections::HashSet;
-use std::fmt;
-use std::hash::{Hash, Hasher};
+use std::hash::Hash;
 use std::ops::Deref;
 use std::sync::Arc;
 
 use crate::{Message, Processor, Sender};
+use classic_derive::message;
 
 use drop::async_trait;
 use drop::crypto::key::exchange::PublicKey;
@@ -38,37 +38,11 @@ pub enum BroadcastError {
     SignError,
 }
 
-#[derive(Deserialize, Serialize, Clone, Eq, PartialEq)]
+#[message]
 pub(crate) enum PcbMessage<M: Message> {
     #[serde(bound(deserialize = "M: Message"))]
-    Gossip(sign::PublicKey, Signature, M),
+    Gossip(Signature, M),
     Subscribe,
-}
-
-#[allow(clippy::derive_hash_xor_eq)]
-impl<M: Message> Hash for PcbMessage<M> {
-    fn hash<H: Hasher>(&self, h: &mut H) {
-        match self {
-            PcbMessage::Gossip(_, signature, message) => {
-                signature.hash(h);
-                message.hash(h);
-            }
-            PcbMessage::Subscribe => 0.hash(h),
-        }
-    }
-}
-
-impl<M: Message> Message for PcbMessage<M> {}
-
-impl<M: Message> fmt::Debug for PcbMessage<M> {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            PcbMessage::Gossip(_, _, msg) => {
-                write!(f, "gossip message {:?}", msg)
-            }
-            PcbMessage::Subscribe => write!(f, "gossip subscribe message"),
-        }
-    }
 }
 
 /// A probabilistic broadcast using Erdös-Rényi Gossip
@@ -137,34 +111,34 @@ impl<M: Message + 'static, S: Sender<PcbMessage<M>> + 'static>
                 debug!("new peer {} subscribed to us", from);
                 self.gossip.write().await.insert(from);
             }
-            PcbMessage::Gossip(pkey, signature, content) => {
-                if *pkey == self.sender {
-                    let mut signer = Signer::new(self.keypair.deref().clone());
-                    let mut delivered = self.delivered.lock().await;
+            PcbMessage::Gossip(signature, content) => {
+                let mut signer = Signer::new(self.keypair.deref().clone());
+                let mut delivered = self.delivered.lock().await;
 
-                    if delivered.is_some() {
-                        debug!("already delivered a message");
-                        return;
-                    }
+                if delivered.is_some() {
+                    debug!("already delivered a message");
+                    return;
+                }
 
-                    if signer.verify(&signature, &pkey, content.deref()).is_ok()
+                if signer
+                    .verify(&signature, &self.sender, content.deref())
+                    .is_ok()
+                {
+                    debug!("good signature for {:?}", message);
+
+                    delivered.replace(content.clone());
+
+                    std::mem::drop(delivered);
+
+                    if let Err(e) =
+                        self.delivered_tx.broadcast(Some(content.clone()))
                     {
-                        debug!("good signature for {:?}", message);
-
-                        delivered.replace(content.clone());
-
-                        std::mem::drop(delivered);
-
-                        if let Err(e) =
-                            self.delivered_tx.broadcast(Some(content.clone()))
-                        {
-                            error!("failed to deliver message: {}", e);
-                        }
-
-                        let dest = self.gossip.read().await;
-
-                        sender.send_many(message, dest.iter()).await;
+                        error!("failed to deliver message: {}", e);
                     }
+
+                    let dest = self.gossip.read().await;
+
+                    sender.send_many(message, dest.iter()).await;
                 }
             }
         }
@@ -263,11 +237,7 @@ impl<M: Message + 'static> ProbabilisticHandle<M> {
             .sign(message)
             .map_err(|_| snafu::NoneError)
             .context(SignError)?;
-        let message = PcbMessage::Gossip(
-            self.keypair.public().clone(),
-            signature,
-            message.clone(),
-        );
+        let message = PcbMessage::Gossip(signature, message.clone());
 
         self.sender
             .send(Arc::new(message.clone()))
@@ -278,18 +248,30 @@ impl<M: Message + 'static> ProbabilisticHandle<M> {
 }
 
 #[cfg(test)]
-mod test {
+pub(crate) mod test {
     use super::*;
 
     use std::time::Duration;
 
     use crate::test::*;
-    use crate::SystemManager;
+    use crate::{CollectingSender, SystemManager};
 
     use lazy_static::lazy_static;
 
     const COUNT: usize = 50;
     const SAMPLE_SIZE: usize = 15;
+
+    pub(crate) fn murmur_message_sequence<M: Message + 'static>(
+        message: M,
+        keypair: &KeyPair,
+        peer_count: usize,
+    ) -> impl Iterator<Item = PcbMessage<M>> {
+        let signature = Signer::new(keypair.clone())
+            .sign(&message)
+            .expect("sign failed");
+        (0..peer_count)
+            .map(move |_| PcbMessage::Gossip(signature, message.clone()))
+    }
 
     #[tokio::test(threaded_scheduler)]
     async fn delivery() {
@@ -308,10 +290,8 @@ mod test {
                     KEYPAIR.read().await.as_ref().expect("bug").clone(),
                 );
                 let message = 0usize;
-                let sender = signer.public().clone();
                 let signature = signer.sign(&message).expect("failed to sign");
-                let message =
-                    PcbMessage::Gossip(sender.clone(), signature, message);
+                let message = PcbMessage::Gossip(signature, message);
 
                 connection.send(&message).await.expect("send failed");
             })
@@ -334,7 +314,10 @@ mod test {
     #[tokio::test]
     async fn broadcast() {
         const MESSAGE: usize = 0;
-        let keypair = Arc::new(KeyPair::random());
+        lazy_static! {
+            static ref KEYPAIR: Arc<KeyPair> = Arc::new(KeyPair::random());
+        };
+        let keypair = KEYPAIR.clone();
         let sender = Probabilistic::new_sender(keypair.clone(), SAMPLE_SIZE);
         let (_, handles, system) =
             create_system(COUNT, |mut connection| async move {
@@ -345,15 +328,11 @@ mod test {
                 .await
                 {
                     match msg.expect("recv failed") {
-                        PcbMessage::Gossip(
-                            ref sender,
-                            ref signature,
-                            ref message,
-                        ) => {
+                        PcbMessage::Gossip(ref signature, ref message) => {
                             let mut signer = Signer::random();
 
                             signer
-                                .verify(signature, sender, message)
+                                .verify(signature, KEYPAIR.public(), message)
                                 .expect("failed to verify message");
 
                             assert_eq!(0usize, *message, "wrong message");
@@ -370,5 +349,34 @@ mod test {
         handle.broadcast(&MESSAGE).await.expect("broadcast failed");
 
         handles.await.expect("panic error");
+    }
+
+    #[tokio::test]
+    async fn subscribe() {
+        let keypair = Arc::new(KeyPair::random());
+        let keys = keyset(COUNT).collect::<HashSet<_>>();
+        let subscribes =
+            keys.iter().zip((0..COUNT).map(|_| PcbMessage::Subscribe));
+
+        let processor =
+            Arc::new(Probabilistic::<usize>::new_sender(keypair, SAMPLE_SIZE));
+        let sender = Arc::new(CollectingSender::new(keys.iter().cloned()));
+
+        use futures::future;
+
+        future::join_all(subscribes.map(|(key, sub)| {
+            processor
+                .clone()
+                .process(Arc::new(sub), *key, sender.clone())
+        }))
+        .await;
+
+        let (skeys, messages): (Vec<_>, Vec<_>) =
+            sender.messages().await.into_iter().unzip();
+
+        assert!(skeys.into_iter().all(|x| keys.contains(&x)));
+        messages
+            .into_iter()
+            .for_each(|msg| assert_eq!(&PcbMessage::Subscribe, msg.deref()));
     }
 }
