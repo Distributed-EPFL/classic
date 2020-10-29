@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::marker::PhantomData;
 use std::ops::Deref;
 use std::sync::Arc;
@@ -471,7 +471,7 @@ where
 /// A `Sender` that only collects messages instead of sending them
 pub struct CollectingSender<M: Message> {
     messages: Mutex<Vec<(PublicKey, Arc<M>)>>,
-    keys: Vec<PublicKey>,
+    keys: Mutex<HashSet<PublicKey>>,
 }
 
 impl<M: Message> CollectingSender<M> {
@@ -480,7 +480,7 @@ impl<M: Message> CollectingSender<M> {
     pub fn new<I: IntoIterator<Item = PublicKey>>(keys: I) -> Self {
         Self {
             messages: Mutex::new(Vec::new()),
-            keys: keys.into_iter().collect(),
+            keys: Mutex::new(keys.into_iter().collect()),
         }
     }
 
@@ -497,19 +497,19 @@ impl<M: Message + 'static> Sender<M> for CollectingSender<M> {
         message: Arc<M>,
         key: &PublicKey,
     ) -> Result<(), SenderError> {
-        ensure!(self.keys.contains(key), NoSuchPeer);
+        ensure!(self.keys.lock().await.contains(key), NoSuchPeer);
 
         self.messages.lock().await.push((*key, message));
 
         Ok(())
     }
 
-    async fn add_connection(&self, _write: ConnectionWrite) {
-        todo!()
+    async fn add_connection(&self, write: ConnectionWrite) {
+        self.keys.lock().await.insert(*write.remote_pkey());
     }
 
     async fn keys(&self) -> Vec<PublicKey> {
-        self.keys.clone()
+        self.keys.lock().await.clone().iter().copied().collect()
     }
 }
 
