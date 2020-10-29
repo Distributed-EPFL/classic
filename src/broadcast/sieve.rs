@@ -38,18 +38,20 @@ pub enum SieveError {
 
 /// Type of message exchanged for probabilistic double echo
 #[message]
-pub(crate) enum PdeMessage<M: Message> {
+pub enum SieveMessage<M: Message> {
     #[serde(bound(deserialize = "M: Message"))]
+    /// Wraps a message from Murmur into a SieveMessage
     Probabilistic(PcbMessage<(M, Signature)>),
     #[serde(bound(deserialize = "M: Message"))]
+    /// Message used during echo rounds
     Echo(M, Signature),
     /// Subscribe to the `Echo` set of a remote peer
     EchoSubscribe,
 }
 
-impl<M: Message> From<PcbMessage<(M, Signature)>> for PdeMessage<M> {
+impl<M: Message> From<PcbMessage<(M, Signature)>> for SieveMessage<M> {
     fn from(v: PcbMessage<(M, Signature)>) -> Self {
-        PdeMessage::Probabilistic(v)
+        SieveMessage::Probabilistic(v)
     }
 }
 
@@ -192,21 +194,21 @@ impl<M: Message> Sieve<M> {
 }
 
 #[async_trait]
-impl<M, S> Processor<PdeMessage<M>, M, S> for Sieve<M>
+impl<M, S> Processor<SieveMessage<M>, M, S> for Sieve<M>
 where
-    S: Sender<PdeMessage<M>> + 'static,
+    S: Sender<SieveMessage<M>> + 'static,
     M: Message + 'static,
 {
     type Handle = SieveHandle<M>;
 
     async fn process(
         self: Arc<Self>,
-        message: Arc<PdeMessage<M>>,
+        message: Arc<SieveMessage<M>>,
         from: PublicKey,
         sender: Arc<S>,
     ) {
         match message.deref() {
-            PdeMessage::Echo(message, signature) => {
+            SieveMessage::Echo(message, signature) => {
                 debug!("echo message from {}", from);
                 let mut signer = self.signer();
 
@@ -224,12 +226,13 @@ where
                     }
                 }
             }
-            PdeMessage::EchoSubscribe => {
+            SieveMessage::EchoSubscribe => {
                 if let Some((message, signature)) =
                     self.echo.lock().await.deref()
                 {
                     debug!("echo subscription from {}", from);
-                    let message = PdeMessage::Echo(message.clone(), *signature);
+                    let message =
+                        SieveMessage::Echo(message.clone(), *signature);
 
                     if let Err(e) = sender.send(Arc::new(message), &from).await
                     {
@@ -240,7 +243,7 @@ where
                 self.echo_set.write().await.insert(from);
             }
 
-            PdeMessage::Probabilistic(msg) => {
+            SieveMessage::Probabilistic(msg) => {
                 debug!("processing murmur message {:?}", msg);
 
                 let murmur_sender =
@@ -290,7 +293,7 @@ where
 
         subscribe_sender
             .send_many(
-                Arc::new(PdeMessage::<M>::EchoSubscribe),
+                Arc::new(SieveMessage::<M>::EchoSubscribe),
                 self.echo_set.read().await.iter(),
             )
             .await;
@@ -320,7 +323,7 @@ where
 /// run on a `SystemManager`
 pub struct SieveHandle<M: Message> {
     incoming: mpsc::Receiver<M>,
-    outgoing: Option<mpsc::Sender<PdeMessage<M>>>,
+    outgoing: Option<mpsc::Sender<SieveMessage<M>>>,
     signer: Signer,
 }
 
@@ -328,7 +331,7 @@ impl<M: Message> SieveHandle<M> {
     fn new(
         keypair: Arc<KeyPair>,
         incoming: mpsc::Receiver<M>,
-        outgoing: Option<mpsc::Sender<PdeMessage<M>>>,
+        outgoing: Option<mpsc::Sender<SieveMessage<M>>>,
     ) -> Self {
         Self {
             signer: Signer::new(keypair.deref().clone()),
@@ -359,7 +362,7 @@ impl<M: Message> SieveHandle<M> {
         let mut sender = self.outgoing.take().context(NotASender)?;
         let signature =
             self.signer.sign(&message).expect("failed to sign message");
-        let message = PdeMessage::Echo(message, signature);
+        let message = SieveMessage::Echo(message, signature);
 
         sender
             .send(message)
@@ -420,7 +423,7 @@ pub(crate) mod test {
         keypair: &KeyPair,
         message: T,
         peer_count: usize,
-    ) -> (DummyManager<PdeMessage<T>, T>, Signature) {
+    ) -> (DummyManager<SieveMessage<T>, T>, Signature) {
         let mut signer = Signer::new(keypair.clone());
         let signature = signer.sign(&message).expect("sign failed");
         let echos = sieve_message_sequence(keypair, message, peer_count)
@@ -440,7 +443,7 @@ pub(crate) mod test {
         keypair: &KeyPair,
         message: M,
         peer_count: usize,
-    ) -> impl Iterator<Item = PdeMessage<M>> {
+    ) -> impl Iterator<Item = SieveMessage<M>> {
         let signature = Signer::new(keypair.clone())
             .sign(&message)
             .expect("sign failed");
@@ -450,11 +453,11 @@ pub(crate) mod test {
             keypair,
             peer_count,
         )
-        .map(PdeMessage::Probabilistic);
+        .map(SieveMessage::Probabilistic);
 
         gossip.chain(
             (0..peer_count)
-                .map(move |_| PdeMessage::Echo(message.clone(), signature)),
+                .map(move |_| SieveMessage::Echo(message.clone(), signature)),
         )
     }
 
