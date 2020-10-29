@@ -30,7 +30,8 @@ pub use multishot::{
 };
 
 mod sieve;
-pub use sieve::{Sieve, SieveHandle};
+pub use sieve::*;
+
 
 mod uniform;
 pub use uniform::{
@@ -38,7 +39,7 @@ pub use uniform::{
 };
 
 mod probabilistic;
-pub use probabilistic::{Probabilistic, ProbabilisticHandle};
+pub use probabilistic::*;
 
 /// This is the error type returned by `Broadcaster::broadcast`.
 /// If this value is `None` the `Broadcaster` is not in an usable state anymore
