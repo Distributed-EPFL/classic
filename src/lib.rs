@@ -10,8 +10,8 @@ use std::hash::Hash;
 
 pub use serde::{Deserialize, Serialize};
 
-mod broadcast;
-pub use broadcast::*;
+/// Provides different broadcast primitives
+pub mod broadcast;
 
 mod system;
 pub use system::System;
