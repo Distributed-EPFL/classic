@@ -21,3 +21,13 @@ snafu = "0.6"
 [dev-dependencies]
 tracing-subscriber = "*"
 lazy_static = "*"
+criterion = "0.3"
+cpuprofiler = "0.0.4"
+
+[profile.bench]
+debug = true
+
+[[bench]]
+name = "benches"
+harness = false
+
