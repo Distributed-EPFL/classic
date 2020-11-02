@@ -34,12 +34,10 @@ pub use sieve::*;
 
 
 mod uniform;
-pub use uniform::{
-    UniformReliable, UniformReliableBroadcaster, UniformReliableDeliverer,
-};
+pub use uniform::*;
 
-mod probabilistic;
-pub use probabilistic::*;
+mod murmur;
+pub use murmur::*;
 
 /// This is the error type returned by `Broadcaster::broadcast`.
 /// If this value is `None` the `Broadcaster` is not in an usable state anymore

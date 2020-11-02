@@ -39,14 +39,17 @@ pub enum BroadcastError {
 }
 
 #[message]
-pub(crate) enum PcbMessage<M: Message> {
+/// Message exchanged by the murmur algorithm
+pub enum MurmurMessage<M: Message> {
     #[serde(bound(deserialize = "M: Message"))]
+    /// Message used during gossiping by the murmur algorithm
     Gossip(Signature, M),
+    /// Subscription request for the murmur algorithm
     Subscribe,
 }
 
 /// A probabilistic broadcast using Erdös-Rényi Gossip
-pub struct Probabilistic<M: Message + 'static> {
+pub struct Murmur<M: Message + 'static> {
     keypair: Arc<KeyPair>,
     sender: sign::PublicKey,
     delivered_tx: watch::Sender<Option<M>>,
@@ -56,7 +59,7 @@ pub struct Probabilistic<M: Message + 'static> {
     expected: usize,
 }
 
-impl<M: Message + 'static> Probabilistic<M> {
+impl<M: Message + 'static> Murmur<M> {
     /// Create a new probabilistic broadcast sender with your local `KeyPair`
     pub fn new_sender(keypair: Arc<KeyPair>, expected: usize) -> Self {
         let (delivered_tx, delivered_rx) = watch::channel(None);
@@ -95,23 +98,23 @@ impl<M: Message + 'static> Probabilistic<M> {
 }
 
 #[async_trait]
-impl<M: Message + 'static, S: Sender<PcbMessage<M>> + 'static>
-    Processor<PcbMessage<M>, M, S> for Probabilistic<M>
+impl<M: Message + 'static, S: Sender<MurmurMessage<M>> + 'static>
+    Processor<MurmurMessage<M>, M, S> for Murmur<M>
 {
-    type Handle = ProbabilisticHandle<M>;
+    type Handle = MurmurHandle<M>;
 
     async fn process(
         self: Arc<Self>,
-        message: Arc<PcbMessage<M>>,
+        message: Arc<MurmurMessage<M>>,
         from: PublicKey,
         sender: Arc<S>,
     ) {
         match message.deref() {
-            PcbMessage::Subscribe => {
+            MurmurMessage::Subscribe => {
                 debug!("new peer {} subscribed to us", from);
                 self.gossip.write().await.insert(from);
             }
-            PcbMessage::Gossip(signature, content) => {
+            MurmurMessage::Gossip(signature, content) => {
                 let mut signer = Signer::new(self.keypair.deref().clone());
                 let mut delivered = self.delivered.lock().await;
 
@@ -182,7 +185,7 @@ impl<M: Message + 'static, S: Sender<PcbMessage<M>> + 'static>
             .take()
             .expect("double setup of processor detected");
 
-        ProbabilisticHandle {
+        MurmurHandle {
             sender,
             delivery,
             keypair: self.keypair.clone(),
@@ -192,13 +195,13 @@ impl<M: Message + 'static, S: Sender<PcbMessage<M>> + 'static>
 
 /// A `Handle` for interacting with a `Probabilistic` instance
 /// to broadcast or deliver a message
-pub struct ProbabilisticHandle<M: Message + 'static> {
+pub struct MurmurHandle<M: Message + 'static> {
     delivery: watch::Receiver<Option<M>>,
-    sender: mpsc::Sender<Arc<PcbMessage<M>>>,
+    sender: mpsc::Sender<Arc<MurmurMessage<M>>>,
     keypair: Arc<KeyPair>,
 }
 
-impl<M: Message + 'static> ProbabilisticHandle<M> {
+impl<M: Message + 'static> MurmurHandle<M> {
     /// Deliver a `Message` using probabilistic broadcast. Calling this method
     /// will consume the `Handle` since probabilistic broadcast is a one use
     /// primitive
@@ -237,7 +240,7 @@ impl<M: Message + 'static> ProbabilisticHandle<M> {
             .sign(message)
             .map_err(|_| snafu::NoneError)
             .context(SignError)?;
-        let message = PcbMessage::Gossip(signature, message.clone());
+        let message = MurmurMessage::Gossip(signature, message.clone());
 
         self.sender
             .send(Arc::new(message.clone()))
@@ -265,12 +268,12 @@ pub(crate) mod test {
         message: M,
         keypair: &KeyPair,
         peer_count: usize,
-    ) -> impl Iterator<Item = PcbMessage<M>> {
+    ) -> impl Iterator<Item = MurmurMessage<M>> {
         let signature = Signer::new(keypair.clone())
             .sign(&message)
             .expect("sign failed");
         (0..peer_count)
-            .map(move |_| PcbMessage::Gossip(signature, message.clone()))
+            .map(move |_| MurmurMessage::Gossip(signature, message.clone()))
     }
 
     #[tokio::test(threaded_scheduler)]
@@ -291,7 +294,7 @@ pub(crate) mod test {
                 );
                 let message = 0usize;
                 let signature = signer.sign(&message).expect("failed to sign");
-                let message = PcbMessage::Gossip(signature, message);
+                let message = MurmurMessage::Gossip(signature, message);
 
                 connection.send(&message).await.expect("send failed");
             })
@@ -299,8 +302,7 @@ pub(crate) mod test {
 
         let manager = SystemManager::new(system);
         let self_keypair = Arc::new(KeyPair::random());
-        let processor =
-            Probabilistic::<usize>::new_receiver(sender, self_keypair, 25);
+        let processor = Murmur::<usize>::new_receiver(sender, self_keypair, 25);
 
         let handle = manager.run(processor).await;
 
@@ -318,17 +320,17 @@ pub(crate) mod test {
             static ref KEYPAIR: Arc<KeyPair> = Arc::new(KeyPair::random());
         };
         let keypair = KEYPAIR.clone();
-        let sender = Probabilistic::new_sender(keypair.clone(), SAMPLE_SIZE);
+        let sender = Murmur::new_sender(keypair.clone(), SAMPLE_SIZE);
         let (_, handles, system) =
             create_system(COUNT, |mut connection| async move {
                 while let Ok(msg) = tokio::time::timeout(
                     Duration::from_millis(100),
-                    connection.receive::<PcbMessage<usize>>(),
+                    connection.receive::<MurmurMessage<usize>>(),
                 )
                 .await
                 {
                     match msg.expect("recv failed") {
-                        PcbMessage::Gossip(ref signature, ref message) => {
+                        MurmurMessage::Gossip(ref signature, ref message) => {
                             let mut signer = Signer::random();
 
                             signer
@@ -337,7 +339,7 @@ pub(crate) mod test {
 
                             assert_eq!(0usize, *message, "wrong message");
                         }
-                        PcbMessage::Subscribe => continue,
+                        MurmurMessage::Subscribe => continue,
                     }
                 }
             })
@@ -355,11 +357,12 @@ pub(crate) mod test {
     async fn subscribe() {
         let keypair = Arc::new(KeyPair::random());
         let keys = keyset(COUNT).collect::<HashSet<_>>();
-        let subscribes =
-            keys.iter().zip((0..COUNT).map(|_| PcbMessage::Subscribe));
+        let subscribes = keys
+            .iter()
+            .zip((0..COUNT).map(|_| MurmurMessage::Subscribe));
 
         let processor =
-            Arc::new(Probabilistic::<usize>::new_sender(keypair, SAMPLE_SIZE));
+            Arc::new(Murmur::<usize>::new_sender(keypair, SAMPLE_SIZE));
         let sender = Arc::new(CollectingSender::new(keys.iter().cloned()));
 
         use futures::future;
@@ -377,6 +380,6 @@ pub(crate) mod test {
         assert!(skeys.into_iter().all(|x| keys.contains(&x)));
         messages
             .into_iter()
-            .for_each(|msg| assert_eq!(&PcbMessage::Subscribe, msg.deref()));
+            .for_each(|msg| assert_eq!(&MurmurMessage::Subscribe, msg.deref()));
     }
 }
