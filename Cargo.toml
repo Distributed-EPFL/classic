@@ -30,4 +30,4 @@ debug = true
 [[bench]]
 name = "benches"
 harness = false
-
+path = "benches/broadcast/lib.rs"
