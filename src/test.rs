@@ -5,7 +5,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::Arc;
 
-use crate::{CollectingSender, Message, Processor, System};
+use crate::{CollectingSender, Message, PoissonSampler, Processor, System};
 
 use drop::crypto::key::exchange::{Exchanger, PublicKey};
 use drop::net::{Connection, Listener, TcpConnector, TcpListener};
@@ -144,12 +144,14 @@ impl<M: Message + 'static, O: Message + 'static> DummyManager<M, O> {
         }
     }
 
-    /// Run a `Processor` using the sequence of message specified at creation
+    /// Run a `Processor` using the sequence of message specified at creation.
+    /// This manager uses `PoissonSampler` internally to sample the known peers.
     pub async fn run<P: Processor<M, O, CollectingSender<M>> + 'static>(
         self,
         mut processor: P,
     ) -> P::Handle {
-        let handle = processor.output(Arc::clone(&self.sender)).await;
+        let sampler = Arc::new(PoissonSampler::default());
+        let handle = processor.output(sampler, Arc::clone(&self.sender)).await;
         let processor = Arc::new(processor);
         let sender = self.sender;
         let total = self.incoming.len();

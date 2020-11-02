@@ -3,6 +3,7 @@ use std::marker::PhantomData;
 use std::ops::Deref;
 use std::sync::Arc;
 
+use super::sampler::Sampler;
 use super::{Message, System};
 
 use drop::async_trait;
@@ -38,7 +39,11 @@ pub trait Processor<M: Message + 'static, O: Message, S: Sender<M>>:
 
     /// Setup the `Processor` using the given sender map and returns a `Handle`
     /// for the user to use.
-    async fn output(&mut self, sender: Arc<S>) -> Self::Handle;
+    async fn output<SA: Sampler>(
+        &mut self,
+        sampler: Arc<SA>,
+        sender: Arc<S>,
+    ) -> Self::Handle;
 }
 
 #[derive(Snafu, Debug)]
@@ -89,12 +94,14 @@ impl<M: Message + 'static> SystemManager<M> {
     /// sending messages. This will return a `Handle` that allows interaction
     /// with the `Processor`.
     pub async fn run<
+        S: Sampler,
         P: Processor<M, O, NetworkSender<M>, Handle = H> + 'static,
         O: Message,
         H,
     >(
         self,
         mut processor: P,
+        sampler: S,
     ) -> H {
         let mut receiver = Self::receive(self.reads);
 
@@ -102,6 +109,7 @@ impl<M: Message + 'static> SystemManager<M> {
 
         debug!("setting up dispatcher...");
 
+        let sampler = Arc::new(sampler);
         let sender = Arc::new(NetworkSender::new(self.writes));
         let sender_add = sender.clone();
         let mut incoming = self.incoming;
@@ -119,7 +127,7 @@ impl<M: Message + 'static> SystemManager<M> {
             }
         });
 
-        let handle = processor.output(sender.clone()).await;
+        let handle = processor.output(sampler, sender.clone()).await;
         let processor = Arc::new(processor);
 
         task::spawn(async move {
@@ -517,6 +525,7 @@ impl<M: Message + 'static> Sender<M> for CollectingSender<M> {
 mod test {
     use super::*;
     use crate::test::*;
+    use crate::AllSampler;
 
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -549,8 +558,9 @@ mod test {
                     .expect("channel failure");
             }
 
-            async fn output(
+            async fn output<SA: Sampler>(
                 &mut self,
+                _sampler: Arc<SA>,
                 _sender: Arc<NetworkSender<usize>>,
             ) -> Self::Handle {
                 let (tx, rx) = mpsc::channel(128);
@@ -569,6 +579,7 @@ mod test {
             })
             .await;
 
+        let sampler = AllSampler::default();
         let processor = Dummy::default();
         let manager = SystemManager::new(system);
 
@@ -576,7 +587,7 @@ mod test {
 
         debug!("registering processor");
 
-        let mut handle = manager.run(processor).await;
+        let mut handle = manager.run(processor, sampler).await;
         let mut messages = Vec::with_capacity(COUNT);
 
         for _ in 0..COUNT {

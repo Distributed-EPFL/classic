@@ -3,7 +3,7 @@ use std::hash::Hash;
 use std::ops::Deref;
 use std::sync::Arc;
 
-use crate::{Message, Processor, Sender};
+use crate::{Message, Processor, Sampler, Sender};
 use classic_derive::message;
 
 use drop::async_trait;
@@ -13,8 +13,6 @@ use drop::crypto::sign::{self, KeyPair, Signature, Signer};
 use serde::{Deserialize, Serialize};
 
 use snafu::{ResultExt, Snafu};
-
-use peroxide::fuga::*;
 
 use tokio::sync::{mpsc, watch, Mutex, RwLock};
 
@@ -147,23 +145,16 @@ impl<M: Message + 'static, S: Sender<MurmurMessage<M>> + 'static>
         }
     }
 
-    async fn output(&mut self, msg_sender: Arc<S>) -> Self::Handle {
+    async fn output<SA: Sampler>(
+        &mut self,
+        sampler: Arc<SA>,
+        msg_sender: Arc<S>,
+    ) -> Self::Handle {
         let (sender, mut receiver) = mpsc::channel(128);
-        let keys = msg_sender.keys().await;
-        let count = keys.len();
-        let prob = self.expected as f64 / count as f64;
-        let sampler = Bernoulli(prob);
-
-        let sample = msg_sender
-            .keys()
+        let sample = sampler
+            .sample(msg_sender.keys().await, self.expected)
             .await
-            .into_iter()
-            .zip(sampler.sample(count))
-            .filter_map(
-                |(key, select)| if select >= 1.0 { Some(key) } else { None },
-            )
-            .collect::<Vec<_>>();
-
+            .expect("sampling failed");
         self.gossip.write().await.extend(sample);
 
         let gossip = self.gossip.clone();
@@ -253,11 +244,12 @@ impl<M: Message + 'static> MurmurHandle<M> {
 #[cfg(test)]
 pub(crate) mod test {
     use super::*;
+    use crate::AllSampler;
 
     use std::time::Duration;
 
     use crate::test::*;
-    use crate::{CollectingSender, SystemManager};
+    use crate::{CollectingSender, PoissonSampler, SystemManager};
 
     use lazy_static::lazy_static;
 
@@ -282,6 +274,7 @@ pub(crate) mod test {
             static ref KEYPAIR: RwLock<Option<KeyPair>> = RwLock::new(None);
         }
 
+        let sampler = PoissonSampler {};
         let keypair = KeyPair::random();
         let sender = keypair.public().clone();
 
@@ -304,7 +297,7 @@ pub(crate) mod test {
         let self_keypair = Arc::new(KeyPair::random());
         let processor = Murmur::<usize>::new_receiver(sender, self_keypair, 25);
 
-        let handle = manager.run(processor).await;
+        let handle = manager.run(processor, sampler).await;
 
         let message = handle.deliver().await.expect("no message delivered");
 
@@ -344,9 +337,10 @@ pub(crate) mod test {
                 }
             })
             .await;
+        let sampler = AllSampler::default();
 
         let manager = SystemManager::new(system);
-        let handle = manager.run(sender).await;
+        let handle = manager.run(sender, sampler).await;
 
         handle.broadcast(&MESSAGE).await.expect("broadcast failed");
 

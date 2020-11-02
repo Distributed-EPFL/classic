@@ -26,7 +26,7 @@ pub use manager::{
 };
 
 mod sampler;
-pub use sampler::Sampler;
+pub use sampler::*;
 
 #[cfg(test)]
 pub mod test;

@@ -4,7 +4,7 @@ use std::hash::Hash;
 use std::ops::Deref;
 use std::sync::Arc;
 
-use super::probabilistic::{PcbMessage, Probabilistic, ProbabilisticHandle};
+use super::{Murmur, MurmurHandle, MurmurMessage};
 use crate::{ConvertSender, Message, Processor, Sampler, Sender};
 
 use classic_derive::message;
@@ -41,7 +41,7 @@ pub enum SieveError {
 pub enum SieveMessage<M: Message> {
     #[serde(bound(deserialize = "M: Message"))]
     /// Wraps a message from Murmur into a SieveMessage
-    Probabilistic(PcbMessage<(M, Signature)>),
+    Probabilistic(MurmurMessage<(M, Signature)>),
     #[serde(bound(deserialize = "M: Message"))]
     /// Message used during echo rounds
     Echo(M, Signature),
@@ -49,8 +49,8 @@ pub enum SieveMessage<M: Message> {
     EchoSubscribe,
 }
 
-impl<M: Message> From<PcbMessage<(M, Signature)>> for SieveMessage<M> {
-    fn from(v: PcbMessage<(M, Signature)>) -> Self {
+impl<M: Message> From<MurmurMessage<(M, Signature)>> for SieveMessage<M> {
+    fn from(v: MurmurMessage<(M, Signature)>) -> Self {
         SieveMessage::Probabilistic(v)
     }
 }
@@ -72,8 +72,8 @@ pub struct Sieve<M: Message + 'static> {
     echo_replies: RwLock<HashMap<PublicKey, (M, Signature)>>,
     echo_threshold: usize,
 
-    probabilistic: Arc<Probabilistic<(M, Signature)>>,
-    handle: Mutex<Option<ProbabilisticHandle<(M, Signature)>>>,
+    murmur: Arc<Murmur<(M, Signature)>>,
+    handle: Mutex<Option<MurmurHandle<(M, Signature)>>>,
 }
 
 impl<M: Message> Sieve<M> {
@@ -89,11 +89,8 @@ impl<M: Message> Sieve<M> {
         echo_threshold: usize,
         pb_size: usize,
     ) -> Self {
-        let probabilistic = Probabilistic::new_receiver(
-            sender.clone(),
-            keypair.clone(),
-            pb_size,
-        );
+        let murmur =
+            Murmur::new_receiver(sender.clone(), keypair.clone(), pb_size);
 
         Self {
             sender,
@@ -106,7 +103,7 @@ impl<M: Message> Sieve<M> {
             echo_set: RwLock::new(HashSet::with_capacity(pb_size)),
             echo_replies: RwLock::new(HashMap::with_capacity(echo_threshold)),
 
-            probabilistic: Arc::new(probabilistic),
+            murmur: Arc::new(murmur),
             handle: Mutex::new(None),
         }
     }
@@ -117,7 +114,7 @@ impl<M: Message> Sieve<M> {
         echo_threshold: usize,
         pb_size: usize,
     ) -> Self {
-        let probabilistic = Probabilistic::new_sender(keypair.clone(), pb_size);
+        let murmur = Murmur::new_sender(keypair.clone(), pb_size);
 
         Self {
             sender: keypair.public().clone(),
@@ -130,7 +127,7 @@ impl<M: Message> Sieve<M> {
             echo_set: RwLock::new(HashSet::with_capacity(pb_size)),
             echo_replies: RwLock::new(HashMap::with_capacity(echo_threshold)),
 
-            probabilistic: Arc::new(probabilistic),
+            murmur: Arc::new(murmur),
             handle: Mutex::new(None),
         }
     }
@@ -249,7 +246,7 @@ where
                 let murmur_sender =
                     Arc::new(ConvertSender::new(sender.clone()));
 
-                self.probabilistic
+                self.murmur
                     .clone()
                     .process(Arc::new(msg.clone()), from, murmur_sender)
                     .await;
@@ -270,24 +267,27 @@ where
         }
     }
 
-    async fn output(&mut self, sender: Arc<S>) -> Self::Handle {
+    async fn output<SA: Sampler>(
+        &mut self,
+        sampler: Arc<SA>,
+        sender: Arc<S>,
+    ) -> Self::Handle {
         let (outgoing_tx, mut outgoing_rx) = mpsc::channel(1);
         let (incoming_tx, incoming_rx) = mpsc::channel(1);
-        let sampler = Sampler::new(sender.clone());
         let subscribe_sender = sender.clone();
 
+        let sample = sampler
+            .sample(sender.keys().await, self.expected)
+            .await
+            .expect("sampling failed");
+
         let murmur_sender = Arc::new(ConvertSender::new(sender));
-        let handle = Arc::get_mut(&mut self.probabilistic)
+        let handle = Arc::get_mut(&mut self.murmur)
             .expect("setup error")
-            .output(murmur_sender)
+            .output(sampler.clone(), murmur_sender)
             .await;
 
         debug!("sampling for echo set");
-
-        let sample = sampler
-            .sample(self.expected)
-            .await
-            .expect("sampling failed");
 
         self.echo_set.write().await.extend(sample);
 
@@ -378,7 +378,7 @@ impl<M: Message> SieveHandle<M> {
 pub(crate) mod test {
     use super::*;
 
-    use super::super::probabilistic::test::murmur_message_sequence;
+    use super::super::murmur::test::murmur_message_sequence;
     use crate::test::*;
 
     const SIZE: usize = 50;
