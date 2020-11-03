@@ -82,3 +82,62 @@ impl Sampler for AllSampler {
         Ok(keys.into_iter().collect())
     }
 }
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use crate::test::*;
+    use crate::{CollectingSender, Message, Sender};
+
+    impl Message for () {}
+
+    static EXPECTED: usize = 100;
+    static ROUNDS: usize = 100;
+
+    macro_rules! sampling_test {
+        ($sampler:ty, $size:expr, $lower:expr, $upper:expr) => {
+            let mut total = 0;
+
+            for _ in 0..ROUNDS {
+                let size = $size;
+                let sender = CollectingSender::new(keyset(size));
+                let sample =
+                    test_sampler::<$sampler, _>(sender, size / 2).await;
+
+                total += sample.len();
+            }
+
+            let average = total / ROUNDS;
+
+            assert!(average >= $lower);
+            assert!(average <= $upper);
+        };
+    }
+
+    async fn test_sampler<D: Default + Sampler, S: Sender<()>>(
+        sender: S,
+        expected: usize,
+    ) -> HashSet<PublicKey> {
+        let keys = sender.keys().await;
+
+        D::default()
+            .sample(keys, expected)
+            .await
+            .expect("sampling failed")
+    }
+
+    #[tokio::test]
+    async fn poisson() {
+        sampling_test!(
+            PoissonSampler,
+            EXPECTED,
+            EXPECTED / 2 - 5,
+            EXPECTED / 2 + 5
+        );
+    }
+
+    #[tokio::test]
+    async fn all() {
+        sampling_test!(AllSampler, EXPECTED, EXPECTED, EXPECTED);
+    }
+}
