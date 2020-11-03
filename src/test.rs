@@ -5,7 +5,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::Arc;
 
-use crate::{CollectingSender, Message, PoissonSampler, Processor, System};
+use crate::{AllSampler, CollectingSender, Message, Processor, System};
 
 use drop::crypto::key::exchange::{Exchanger, PublicKey};
 use drop::net::{Connection, Listener, TcpConnector, TcpListener};
@@ -150,7 +150,7 @@ impl<M: Message + 'static, O: Message + 'static> DummyManager<M, O> {
         self,
         mut processor: P,
     ) -> P::Handle {
-        let sampler = Arc::new(PoissonSampler::default());
+        let sampler = Arc::new(AllSampler::default());
         let handle = processor.output(sampler, Arc::clone(&self.sender)).await;
         let processor = Arc::new(processor);
         let sender = self.sender;
