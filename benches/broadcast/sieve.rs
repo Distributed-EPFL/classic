@@ -10,7 +10,9 @@ use super::*;
 pub fn criterion_benchmark(c: &mut Criterion) {
     let group = c.benchmark_group("sieve");
 
-    bench_all_size!(group, SIZE, |b, &size| {
+    // SIZE * 2 since we have to deliver the correct sequence of Murmur messages
+    // *and* the correct sequence of Sieve messages
+    bench_all_size!(group, SIZE * 2, |b, &size| {
         b.iter_batched_ref(
             || {
                 let keypair = KeyPair::random();
