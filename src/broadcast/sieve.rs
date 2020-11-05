@@ -5,7 +5,10 @@ use std::ops::Deref;
 use std::sync::Arc;
 
 use super::{Murmur, MurmurHandle, MurmurMessage};
-use crate::{ConvertSender, Message, Processor, Sampler, Sender};
+use crate::{
+    implement_handle, ConvertSender, Handle, Message, Processor, Sampler,
+    Sender,
+};
 
 use classic_derive::message;
 
@@ -17,24 +20,10 @@ use serde::{Deserialize, Serialize};
 
 use snafu::{OptionExt, ResultExt, Snafu};
 
-use tokio::sync::{mpsc, Mutex, RwLock};
+use tokio::sync::{oneshot, Mutex, RwLock};
 use tokio::task;
 
 use tracing::{debug, error, warn};
-
-#[derive(Snafu, Debug)]
-/// Type of errors returned by `SieveHandle`
-pub enum SieveError {
-    #[snafu(display("this handle is not a sender handle"))]
-    /// Tried to call `SieveHandle::broadcast` on an instance created using
-    /// `Sieve::new_receiver`
-    NotASender,
-
-    #[snafu(display("the associated sender died too early"))]
-    /// The associated `Sieve` instance does not exist anymore, and the
-    /// message couldn't be broadcasted
-    SenderDied,
-}
 
 /// Type of message exchanged for probabilistic double echo
 #[message]
@@ -57,11 +46,18 @@ impl<M: Message> From<MurmurMessage<(M, Signature)>> for SieveMessage<M> {
 
 impl<M: Message> Message for (M, Signature) {}
 
+implement_handle!(
+    SieveHandle,
+    SieveError,
+    SieveMessage,
+    |message, signature| { SieveMessage::Echo(message, signature) }
+);
+
 /// An implementation of the `Sieve` probabilistic consistent broadcast
 /// algorithm. `Sieve` is a single-shot shot broadcast algorithm using
 /// a designated sender for each instance.
 pub struct Sieve<M: Message + 'static> {
-    deliverer: Mutex<Option<mpsc::Sender<M>>>,
+    deliverer: Mutex<Option<oneshot::Sender<M>>>,
     sender: sign::PublicKey,
     keypair: Arc<KeyPair>,
 
@@ -213,9 +209,8 @@ where
                     && self.update_echo_set(from, signature, message).await
                     && self.check_echo_set(signature, message).await
                 {
-                    if let Some(mut sender) = self.deliverer.lock().await.take()
-                    {
-                        if sender.send(message.clone()).await.is_err() {
+                    if let Some(sender) = self.deliverer.lock().await.take() {
+                        if sender.send(message.clone()).is_err() {
                             error!("handle doesn't exist anymore for delivery");
                         }
                     } else {
@@ -254,7 +249,8 @@ where
                 let mut guard = self.handle.lock().await;
 
                 if let Some(mut handle) = guard.take() {
-                    if let Some((message, signature)) = handle.try_deliver() {
+                    if let Ok(Some((message, signature))) = handle.try_deliver()
+                    {
                         debug!("delivered {:?} using murmur", message);
                         *self.echo.lock().await = Some((message, signature));
                     } else {
@@ -272,8 +268,8 @@ where
         sampler: Arc<SA>,
         sender: Arc<S>,
     ) -> Self::Handle {
-        let (outgoing_tx, mut outgoing_rx) = mpsc::channel(1);
-        let (incoming_tx, incoming_rx) = mpsc::channel(1);
+        let (outgoing_tx, outgoing_rx) = oneshot::channel();
+        let (incoming_tx, incoming_rx) = oneshot::channel();
         let subscribe_sender = sender.clone();
 
         let sample = sampler
@@ -303,7 +299,7 @@ where
 
         let outgoing_tx = if self.sender == *self.keypair.public() {
             task::spawn(async move {
-                if let Some(msg) = outgoing_rx.recv().await {
+                if let Ok(msg) = outgoing_rx.await {
                     todo!("use murmur on {:?}", msg);
                 } else {
                     error!("broadcast sender not used");
@@ -316,61 +312,6 @@ where
         };
 
         SieveHandle::new(self.keypair.clone(), incoming_rx, outgoing_tx)
-    }
-}
-
-/// A handle to interact with a `Sieve` instance once it has been scheduled to
-/// run on a `SystemManager`
-pub struct SieveHandle<M: Message> {
-    incoming: mpsc::Receiver<M>,
-    outgoing: Option<mpsc::Sender<SieveMessage<M>>>,
-    signer: Signer,
-}
-
-impl<M: Message> SieveHandle<M> {
-    fn new(
-        keypair: Arc<KeyPair>,
-        incoming: mpsc::Receiver<M>,
-        outgoing: Option<mpsc::Sender<SieveMessage<M>>>,
-    ) -> Self {
-        Self {
-            signer: Signer::new(keypair.deref().clone()),
-            incoming,
-            outgoing,
-        }
-    }
-
-    /// Deliver a `Message` using the `Sieve` algorithm. Since `Sieve` is a
-    /// one-shot algorithm, a `SieveHandle` can only deliver one message.
-    /// All subsequent calls to this method will return `None`.
-    pub async fn deliver(&mut self) -> Option<M> {
-        self.incoming.recv().await
-    }
-
-    /// Attempts delivery of a `Message` using the `Sieve` algorithm.
-    /// This method returns `None` immediately if no `Message` is ready for
-    /// delivery
-    pub fn try_deliver(&mut self) -> Option<M> {
-        self.incoming.try_recv().ok()
-    }
-
-    /// Broadcast a message using the associated `Sieve` instance. <br />
-    /// This will return an error if the `Sieve` was created using
-    /// `Sieve::new_receiver` or if this is not the first time this method is
-    /// called
-    pub async fn broadcast(&mut self, message: M) -> Result<(), SieveError> {
-        let mut sender = self.outgoing.take().context(NotASender)?;
-        let signature =
-            self.signer.sign(&message).expect("failed to sign message");
-        let message = SieveMessage::Echo(message, signature);
-
-        sender
-            .send(message)
-            .await
-            .map_err(|_| snafu::NoneError)
-            .context(SenderDied)?;
-
-        Ok(())
     }
 }
 
@@ -509,7 +450,7 @@ pub(crate) mod test {
 
         let mut handle = manager.run(processor).await;
 
-        handle.broadcast(MESSAGE).await.expect("broadcast failed");
+        handle.broadcast(&MESSAGE).await.expect("broadcast failed");
 
         let message = handle.deliver().await.expect("deliver failed");
 

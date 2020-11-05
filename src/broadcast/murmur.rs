@@ -3,7 +3,7 @@ use std::hash::Hash;
 use std::ops::Deref;
 use std::sync::Arc;
 
-use crate::{Message, Processor, Sampler, Sender};
+use crate::{implement_handle, Handle, Message, Processor, Sampler, Sender};
 use classic_derive::message;
 
 use drop::async_trait;
@@ -12,29 +12,12 @@ use drop::crypto::sign::{self, KeyPair, Signature, Signer};
 
 use serde::{Deserialize, Serialize};
 
-use snafu::{ResultExt, Snafu};
+use snafu::{OptionExt, ResultExt, Snafu};
 
-use tokio::sync::{mpsc, watch, Mutex, RwLock};
+use tokio::sync::{oneshot, Mutex, RwLock};
 
 use tracing::{debug, debug_span, error};
 use tracing_futures::Instrument;
-
-#[derive(Snafu, Debug)]
-/// Error type returned by `Probablistic` broadcast instances
-pub enum BroadcastError {
-    #[snafu(display("already sent a message using this instance"))]
-    /// Since `Probabilistic` broadcast is a "one-shot" primitive
-    /// this error is returned when the instance has already been
-    /// used to broadcast or receive a message.
-    AlreadyUsed,
-    #[snafu(display("this broadcast instance is a receiver"))]
-    /// This error is returned when trying to broadcast a message using
-    /// a `Probabilistic` instance that was created using
-    /// `Probabilistic::new_receiver`
-    NotASender,
-    #[snafu(display("couldn't sign message"))]
-    SignError,
-}
 
 #[message]
 /// Message exchanged by the murmur algorithm
@@ -46,12 +29,19 @@ pub enum MurmurMessage<M: Message> {
     Subscribe,
 }
 
+implement_handle!(
+    MurmurHandle,
+    MurmurError,
+    MurmurMessage,
+    |message, signature| { MurmurMessage::Gossip(signature, message) }
+);
+
 /// A probabilistic broadcast using Erdös-Rényi Gossip
 pub struct Murmur<M: Message + 'static> {
     keypair: Arc<KeyPair>,
     sender: sign::PublicKey,
-    delivered_tx: watch::Sender<Option<M>>,
-    delivery: Option<watch::Receiver<Option<M>>>,
+    delivered_tx: Mutex<Option<oneshot::Sender<M>>>,
+    delivery: Option<oneshot::Receiver<M>>,
     delivered: Mutex<Option<M>>,
     gossip: Arc<RwLock<HashSet<PublicKey>>>,
     expected: usize,
@@ -60,13 +50,13 @@ pub struct Murmur<M: Message + 'static> {
 impl<M: Message + 'static> Murmur<M> {
     /// Create a new probabilistic broadcast sender with your local `KeyPair`
     pub fn new_sender(keypair: Arc<KeyPair>, expected: usize) -> Self {
-        let (delivered_tx, delivered_rx) = watch::channel(None);
+        let (delivered_tx, delivered_rx) = oneshot::channel();
         let sender = keypair.public().clone();
 
         Self {
             keypair,
             sender,
-            delivered_tx,
+            delivered_tx: Mutex::new(Some(delivered_tx)),
             delivery: Some(delivered_rx),
             delivered: Mutex::new(None),
             gossip: Arc::new(RwLock::new(HashSet::with_capacity(expected))),
@@ -81,13 +71,13 @@ impl<M: Message + 'static> Murmur<M> {
         keypair: Arc<KeyPair>,
         expected: usize,
     ) -> Self {
-        let (delivered_tx, delivered_rx) = watch::channel(None);
+        let (delivered_tx, delivered_rx) = oneshot::channel();
 
         Self {
             expected,
             sender,
             keypair,
-            delivered_tx,
+            delivered_tx: Mutex::new(Some(delivered_tx)),
             delivery: Some(delivered_rx),
             delivered: Mutex::new(None),
             gossip: Arc::new(RwLock::new(HashSet::with_capacity(expected))),
@@ -131,10 +121,12 @@ impl<M: Message + 'static, S: Sender<MurmurMessage<M>> + 'static>
 
                     std::mem::drop(delivered);
 
-                    if let Err(e) =
-                        self.delivered_tx.broadcast(Some(content.clone()))
-                    {
-                        error!("failed to deliver message: {}", e);
+                    if let Some(chan) = self.delivered_tx.lock().await.take() {
+                        if chan.send(content.clone()).is_err() {
+                            error!("handle removed before delivery");
+                        }
+                    } else {
+                        debug!("late murmur message");
                     }
 
                     let dest = self.gossip.read().await;
@@ -150,7 +142,6 @@ impl<M: Message + 'static, S: Sender<MurmurMessage<M>> + 'static>
         sampler: Arc<SA>,
         msg_sender: Arc<S>,
     ) -> Self::Handle {
-        let (sender, mut receiver) = mpsc::channel(128);
         let sample = sampler
             .sample(msg_sender.keys().await, self.expected)
             .await
@@ -159,85 +150,34 @@ impl<M: Message + 'static, S: Sender<MurmurMessage<M>> + 'static>
 
         let gossip = self.gossip.clone();
 
-        tokio::task::spawn(
-            async move {
-                let sender = msg_sender;
-                let gossip = gossip;
+        let sender = if self.keypair.public() == &self.sender {
+            let (sender, receiver) = oneshot::channel();
 
-                if let Some(out) = receiver.recv().await {
-                    sender.send_many(out, gossip.read().await.iter()).await;
+            tokio::task::spawn(
+                async move {
+                    let sender = msg_sender;
+                    let gossip = gossip;
+
+                    if let Ok(out) = receiver.await {
+                        let out = Arc::new(out);
+
+                        sender.send_many(out, gossip.read().await.iter()).await;
+                    }
                 }
-            }
-            .instrument(debug_span!("murmur_gossip")),
-        );
+                .instrument(debug_span!("murmur_gossip")),
+            );
+
+            Some(sender)
+        } else {
+            None
+        };
 
         let delivery = self
             .delivery
             .take()
             .expect("double setup of processor detected");
 
-        MurmurHandle {
-            sender,
-            delivery,
-            keypair: self.keypair.clone(),
-        }
-    }
-}
-
-/// A `Handle` for interacting with a `Probabilistic` instance
-/// to broadcast or deliver a message
-pub struct MurmurHandle<M: Message + 'static> {
-    delivery: watch::Receiver<Option<M>>,
-    sender: mpsc::Sender<Arc<MurmurMessage<M>>>,
-    keypair: Arc<KeyPair>,
-}
-
-impl<M: Message + 'static> MurmurHandle<M> {
-    /// Deliver a `Message` using probabilistic broadcast. Calling this method
-    /// will consume the `Handle` since probabilistic broadcast is a one use
-    /// primitive
-    pub async fn deliver(mut self) -> Option<M> {
-        match self.delivery.recv().await {
-            Some(None) => self.delivery.recv().await.flatten(),
-            Some(msg) => msg,
-            None => {
-                error!("no message to deliver");
-                None
-            }
-        }
-    }
-
-    /// Check to see if a message is available to delivered using this handle.
-    /// Returns `None` if no message is available right now.
-    pub fn try_deliver(&mut self) -> Option<M> {
-        if let Some(message) = self.delivery.borrow().deref() {
-            Some(message.clone())
-        } else {
-            None
-        }
-    }
-
-    /// Broadcast a `Message` using the associated probabilistic broadcast
-    /// instance. This will consume the `Handle` since this primitive is a
-    /// one-shot.
-    pub async fn broadcast(
-        mut self,
-        message: &M,
-    ) -> Result<(), BroadcastError> {
-        debug!("broadcasting {:?}", message);
-
-        let mut signer = Signer::new(self.keypair.deref().clone());
-        let signature = signer
-            .sign(message)
-            .map_err(|_| snafu::NoneError)
-            .context(SignError)?;
-        let message = MurmurMessage::Gossip(signature, message.clone());
-
-        self.sender
-            .send(Arc::new(message.clone()))
-            .await
-            .map_err(|_| snafu::NoneError)
-            .context(NotASender)
+        MurmurHandle::new(self.keypair.clone(), delivery, sender)
     }
 }
 
@@ -297,7 +237,7 @@ pub(crate) mod test {
         let self_keypair = Arc::new(KeyPair::random());
         let processor = Murmur::<usize>::new_receiver(sender, self_keypair, 25);
 
-        let handle = manager.run(processor, sampler).await;
+        let mut handle = manager.run(processor, sampler).await;
 
         let message = handle.deliver().await.expect("no message delivered");
 
@@ -340,7 +280,7 @@ pub(crate) mod test {
         let sampler = AllSampler::default();
 
         let manager = SystemManager::new(system);
-        let handle = manager.run(sender, sampler).await;
+        let mut handle = manager.run(sender, sampler).await;
 
         handle.broadcast(&MESSAGE).await.expect("broadcast failed");
 

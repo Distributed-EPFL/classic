@@ -27,7 +27,7 @@ pub trait Processor<M: Message + 'static, O: Message, S: Sender<M>>:
     Send + Sync
 {
     /// The handle used to send and receive messages from the `Processor`
-    type Handle;
+    type Handle: Handle<O>;
 
     /// Process an incoming message using this `Processor`
     async fn process(
@@ -46,16 +46,131 @@ pub trait Processor<M: Message + 'static, O: Message, S: Sender<M>>:
     ) -> Self::Handle;
 }
 
-#[derive(Snafu, Debug)]
-pub enum DeliveryError {
-    #[snafu(display("no more messages can be delivered"))]
-    NoMoreMessage,
+/// An asbtract `Handle` type that allows interacting with a `Processor` once it
+/// has been scheduled to run on a `SystemManager`. This type will usually be
+/// obtained by calling SystemManager::run on a previously created `Processor`
+#[async_trait]
+pub trait Handle<M> {
+    /// Type of errors returned by this `Handle` type
+    type Error: std::error::Error;
+
+    /// Deliver a message using this `Handle`. This method will block until
+    /// either: <br />
+    /// 1. the delivery fails, then the function will return `None`
+    /// 2. the delivery suceeds then the function will return `Some`(message)
+    async fn deliver(&mut self) -> Result<M, Self::Error>;
+
+    /// Poll this `Handle` for delivery, returning immediately with `None` if no
+    /// message is available for delivery or `Some`
+    fn try_deliver(&mut self) -> Result<Option<M>, Self::Error>;
+
+    /// Starts broadcasting a message using this `Handle`
+    async fn broadcast(&mut self, message: &M) -> Result<(), Self::Error>;
 }
 
-#[derive(Snafu, Debug)]
-pub enum Error {
-    #[snafu(display("processor does not exist anymore"))]
-    ChannelError,
+/// A macro to create a Handle for some `Processor` and `Message` type
+#[macro_export]
+macro_rules! implement_handle {
+    ($name:ident, $error:ident, $msg:ident, $create:expr) => {
+        #[derive(Snafu, Debug)]
+        /// Error type for $name
+        pub enum $error {
+            #[snafu(display("this handle is not a sender handle"))]
+            /// Not a sender handle
+            NotASender,
+
+            #[snafu(display("associated sender was destroyed"))]
+            /// The sender associatex with this handle doesn't exist anymore
+            SenderDied,
+
+            #[snafu(display("this handle was already used once"))]
+            /// The handle was already used to broadcast or deliver
+            AlreadyUsed,
+
+            #[snafu(display("unable to deliver a message"))]
+            /// No message could be delivered from this `Handle`
+            NoMessage,
+        }
+
+        /// A `Handle` used to interact with a `Processor`
+        pub struct $name<M: Message> {
+            incoming: Option<tokio::sync::oneshot::Receiver<M>>,
+            outgoing: Option<tokio::sync::oneshot::Sender<$msg<M>>>,
+            signer: Signer,
+        }
+
+        impl<M: Message> $name<M> {
+            fn new(
+                keypair: Arc<KeyPair>,
+                incoming: oneshot::Receiver<M>,
+                outgoing: Option<oneshot::Sender<$msg<M>>>,
+            ) -> Self {
+                Self {
+                    signer: Signer::new(keypair.deref().clone()),
+                    incoming: Some(incoming),
+                    outgoing,
+                }
+            }
+        }
+
+        #[allow(clippy::redundant_closure_call)]
+        #[async_trait]
+        impl<M: Message> Handle<M> for $name<M> {
+            type Error = $error;
+
+            /// Deliver a `Message` using the algorithm associated with this
+            /// `$name`. Since this is a one-shot algorithm, a `$name` can only
+            /// deliver one message.
+            /// All subsequent calls to this method will return `None`
+            async fn deliver(&mut self) -> Result<M, Self::Error> {
+                self.incoming
+                    .take()
+                    .context(AlreadyUsed)?
+                    .await
+                    .map_err(|_| snafu::NoneError)
+                    .context(NoMessage)
+            }
+
+            /// Attempts delivery of a `Message` using the `Sieve` algorithm.
+            /// This method returns `Ok(None)` immediately if no `Message` is
+            /// ready for delivery. `Ok(Some(message))` if a message is ready.
+            /// And finally `Err` if no message can be delivered using this
+            /// handle
+            fn try_deliver(&mut self) -> Result<Option<M>, Self::Error> {
+                let mut deliver = self.incoming.take().context(AlreadyUsed)?;
+
+                match deliver.try_recv() {
+                    Ok(message) => Ok(Some(message)),
+                    Err(oneshot::error::TryRecvError::Empty) => {
+                        self.incoming.replace(deliver);
+                        Ok(None)
+                    }
+                    _ => NoMessage.fail(),
+                }
+            }
+
+            /// Broadcast a message using the associated broadcast instance. <br />
+            /// This will return an error if the instance was created using
+            /// `new_receiver` or if this is not the first time this method is
+            /// called
+            async fn broadcast(
+                &mut self,
+                message: &M,
+            ) -> Result<(), Self::Error> {
+                let sender = self.outgoing.take().context(NotASender)?;
+                let signature =
+                    self.signer.sign(message).expect("failed to sign message");
+                let message = $create(message.clone(), signature);
+
+                sender
+                    .send(message)
+                    .map_err(|_| snafu::NoneError)
+                    .context(SenderDied)?;
+
+                Ok(())
+            }
+        }
+    };
 }
 
 /// Handles sending and receiving messages from all known peers.
@@ -97,7 +212,7 @@ impl<M: Message + 'static> SystemManager<M> {
         S: Sampler,
         P: Processor<M, O, NetworkSender<M>, Handle = H> + 'static,
         O: Message,
-        H,
+        H: Handle<O>,
     >(
         self,
         mut processor: P,
@@ -529,6 +644,31 @@ mod test {
 
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    #[async_trait]
+    impl<M: Message> Handle<(PublicKey, M)> for mpsc::Receiver<(PublicKey, M)> {
+        type Error = mpsc::error::RecvError;
+
+        async fn deliver(&mut self) -> Result<(PublicKey, M), Self::Error> {
+            Ok(self.recv().await.expect("no message"))
+        }
+
+        fn try_deliver(
+            &mut self,
+        ) -> Result<Option<(PublicKey, M)>, Self::Error> {
+            unreachable!()
+        }
+
+        async fn broadcast(
+            &mut self,
+            _: &(PublicKey, M),
+        ) -> Result<(), Self::Error> {
+            unreachable!()
+        }
+    }
+
+    impl Message for PublicKey {}
+    impl<M: Message> Message for (PublicKey, M) {}
+
     #[tokio::test(threaded_scheduler)]
     async fn receive_from_manager() {
         static COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -540,7 +680,7 @@ mod test {
         }
 
         #[async_trait]
-        impl Processor<usize, usize, NetworkSender<usize>> for Dummy {
+        impl Processor<usize, (PublicKey, usize), NetworkSender<usize>> for Dummy {
             type Handle = mpsc::Receiver<(PublicKey, usize)>;
 
             async fn process(
@@ -592,7 +732,7 @@ mod test {
 
         for _ in 0..COUNT {
             let (pkey, message) =
-                handle.recv().await.expect("unexpected end of mesages");
+                handle.deliver().await.expect("unexpected error");
 
             assert!(
                 pkeys.iter().any(|(key, _)| *key == pkey),

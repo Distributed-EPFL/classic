@@ -7,6 +7,7 @@
 use std::collections::VecDeque;
 use std::fmt;
 use std::hash::Hash;
+use std::sync::Arc;
 
 pub use serde::{Deserialize, Serialize};
 
@@ -20,10 +21,7 @@ mod connection;
 pub use connection::{ConnectionError, ConnectionHandle};
 
 mod manager;
-pub use manager::{
-    CollectingSender, ConvertSender, Processor, Sender, SenderError,
-    SystemManager, WrappingSender,
-};
+pub use manager::*;
 
 mod sampler;
 pub use sampler::*;
@@ -55,3 +53,4 @@ impl_m!(u8, i8, u16, i16, u32, i32, u64, i64, u128, i128, usize, String);
 
 impl<T: Message> Message for Vec<T> {}
 impl<T: Message> Message for VecDeque<T> {}
+impl<T: Message> Message for Arc<T> {}
