@@ -25,6 +25,8 @@ use tokio::task;
 
 use tracing::{debug, error, warn};
 
+type SharedHandle<M> = Arc<Mutex<Option<MurmurHandle<(M, Signature)>>>>;
+
 /// Type of message exchanged for probabilistic double echo
 #[message]
 pub enum SieveMessage<M: Message> {
@@ -46,12 +48,7 @@ impl<M: Message> From<MurmurMessage<(M, Signature)>> for SieveMessage<M> {
 
 impl<M: Message> Message for (M, Signature) {}
 
-implement_handle!(
-    SieveHandle,
-    SieveError,
-    SieveMessage,
-    |message, signature| { SieveMessage::Echo(message, signature) }
-);
+implement_handle!(SieveHandle, SieveError, SieveMessage);
 
 /// An implementation of the `Sieve` probabilistic consistent broadcast
 /// algorithm. `Sieve` is a single-shot shot broadcast algorithm using
@@ -69,7 +66,7 @@ pub struct Sieve<M: Message + 'static> {
     echo_threshold: usize,
 
     murmur: Arc<Murmur<(M, Signature)>>,
-    handle: Mutex<Option<MurmurHandle<(M, Signature)>>>,
+    handle: SharedHandle<M>,
 }
 
 impl<M: Message> Sieve<M> {
@@ -100,7 +97,7 @@ impl<M: Message> Sieve<M> {
             echo_replies: RwLock::new(HashMap::with_capacity(echo_threshold)),
 
             murmur: Arc::new(murmur),
-            handle: Mutex::new(None),
+            handle: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -124,7 +121,7 @@ impl<M: Message> Sieve<M> {
             echo_replies: RwLock::new(HashMap::with_capacity(echo_threshold)),
 
             murmur: Arc::new(murmur),
-            handle: Mutex::new(None),
+            handle: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -289,7 +286,7 @@ where
 
         subscribe_sender
             .send_many(
-                Arc::new(SieveMessage::<M>::EchoSubscribe),
+                Arc::new(SieveMessage::EchoSubscribe),
                 self.echo_set.read().await.iter(),
             )
             .await;
@@ -298,9 +295,18 @@ where
         self.deliverer.lock().await.replace(incoming_tx);
 
         let outgoing_tx = if self.sender == *self.keypair.public() {
+            let handle = self.handle.clone();
+
             task::spawn(async move {
                 if let Ok(msg) = outgoing_rx.await {
-                    todo!("use murmur on {:?}", msg);
+                    if let Some(handle) = handle.lock().await.as_mut() {
+                        if let Err(e) = handle.broadcast(&msg).await {
+                            error!(
+                                "unable to broadcast message using murmur: {}",
+                                e
+                            );
+                        }
+                    }
                 } else {
                     error!("broadcast sender not used");
                 }

@@ -29,12 +29,7 @@ pub enum MurmurMessage<M: Message> {
     Subscribe,
 }
 
-implement_handle!(
-    MurmurHandle,
-    MurmurError,
-    MurmurMessage,
-    |message, signature| { MurmurMessage::Gossip(signature, message) }
-);
+implement_handle!(MurmurHandle, MurmurError, MurmurMessage);
 
 /// A probabilistic broadcast using Erdös-Rényi Gossip
 pub struct Murmur<M: Message + 'static> {
@@ -158,8 +153,9 @@ impl<M: Message + 'static, S: Sender<MurmurMessage<M>> + 'static>
                     let sender = msg_sender;
                     let gossip = gossip;
 
-                    if let Ok(out) = receiver.await {
-                        let out = Arc::new(out);
+                    if let Ok((message, signature)) = receiver.await {
+                        let out =
+                            Arc::new(MurmurMessage::Gossip(signature, message));
 
                         sender.send_many(out, gossip.read().await.iter()).await;
                     }

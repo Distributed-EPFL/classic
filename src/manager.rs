@@ -50,7 +50,7 @@ pub trait Processor<M: Message + 'static, O: Message, S: Sender<M>>:
 /// has been scheduled to run on a `SystemManager`. This type will usually be
 /// obtained by calling SystemManager::run on a previously created `Processor`
 #[async_trait]
-pub trait Handle<M> {
+pub trait Handle<M>: Send + Sync {
     /// Type of errors returned by this `Handle` type
     type Error: std::error::Error;
 
@@ -71,7 +71,7 @@ pub trait Handle<M> {
 /// A macro to create a Handle for some `Processor` and `Message` type
 #[macro_export]
 macro_rules! implement_handle {
-    ($name:ident, $error:ident, $msg:ident, $create:expr) => {
+    ($name:ident, $error:ident, $msg:ident) => {
         #[derive(Snafu, Debug)]
         /// Error type for $name
         pub enum $error {
@@ -95,7 +95,7 @@ macro_rules! implement_handle {
         /// A `Handle` used to interact with a `Processor`
         pub struct $name<M: Message> {
             incoming: Option<tokio::sync::oneshot::Receiver<M>>,
-            outgoing: Option<tokio::sync::oneshot::Sender<$msg<M>>>,
+            outgoing: Option<tokio::sync::oneshot::Sender<(M, Signature)>>,
             signer: Signer,
         }
 
@@ -103,7 +103,7 @@ macro_rules! implement_handle {
             fn new(
                 keypair: Arc<KeyPair>,
                 incoming: oneshot::Receiver<M>,
-                outgoing: Option<oneshot::Sender<$msg<M>>>,
+                outgoing: Option<oneshot::Sender<(M, Signature)>>,
             ) -> Self {
                 Self {
                     signer: Signer::new(keypair.deref().clone()),
@@ -160,10 +160,9 @@ macro_rules! implement_handle {
                 let sender = self.outgoing.take().context(NotASender)?;
                 let signature =
                     self.signer.sign(message).expect("failed to sign message");
-                let message = $create(message.clone(), signature);
 
                 sender
-                    .send(message)
+                    .send((message.clone(), signature))
                     .map_err(|_| snafu::NoneError)
                     .context(SenderDied)?;
 
