@@ -8,9 +8,9 @@ edition = "2018"
 
 [dependencies]
 classic-derive = { path = "classic-derive" }
-drop = { git = "https://github.com/Distributed-EPFL/drop", branch = "feature/io" }
+drop = { git = "https://github.com/Distributed-EPFL/drop", branch = "feature/refactor", features = [ "system" ] }
 futures = "~0.3"
-tokio = "~0.2"
+tokio = { version = "0.2", features = [ "sync" ] }
 tracing = "~0.1"
 serde = "~1.0"
 hashbrown = "~0.7"
@@ -23,11 +23,4 @@ tracing-subscriber = "*"
 lazy_static = "*"
 criterion = "0.3"
 cpuprofiler = "0.0.4"
-
-[profile.bench]
-debug = true
-
-[[bench]]
-name = "benches"
-harness = false
-path = "benches/broadcast/lib.rs"
+drop = { git = "https://github.com/Distributed-EPFL/drop", branch = "feature/refactor", features = [ "test" ] }

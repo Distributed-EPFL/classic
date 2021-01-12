@@ -1,261 +1,207 @@
-use std::collections::HashSet;
-
-use super::{Broadcaster, Deliverer, MessageStream};
-use crate::{Message, System};
+use std::ops::Deref;
+use std::sync::Arc;
 
 use drop::async_trait;
 use drop::crypto::key::exchange::PublicKey;
-use drop::net::{Connection, ConnectionRead, ConnectionWrite, SendError};
+use drop::system::manager::Handle;
+use drop::system::{Message, Processor, Sampler, Sender, SenderError};
 
-use futures::future;
-use futures::stream::{self, SelectAll, StreamExt};
+use snafu::{OptionExt, ResultExt, Snafu};
 
-use tokio::sync::mpsc;
-use tokio::task;
+use tokio::sync::{mpsc, Mutex};
 
-use tracing::{debug_span, info, warn};
-use tracing_futures::Instrument;
+use tracing::debug;
 
-fn poll_peers<T>(receiver: &mut mpsc::Receiver<T>, dest: &mut Vec<T>) {
-    while let Ok(reader) = receiver.try_recv() {
-        dest.push(reader);
-    }
+#[derive(Debug, Snafu)]
+/// Errors encountered by `BestEffort`
+pub enum BestEffortError {
+    #[snafu(display("channel is closed"))]
+    /// Channel for delivery is closed
+    Channel,
+    #[snafu(display("send error: {}", source))]
+    /// Network error while broadcasting
+    Network {
+        /// Underlying network error
+        source: SenderError,
+    },
+    #[snafu(display("handle not setup properly"))]
+    /// Handle was not setup properly
+    Setup,
 }
 
-/// A `Broadcast` implementation that does not provide any guarantee of
-/// reliability.
-pub struct BestEffort {}
-
-impl BestEffort {
-    /// Create a new `BestEffort` broadcast that will use the given `System`
-    pub fn with<M: Message + 'static>(
-        mut system: System,
-    ) -> (BestEffortBroadcaster, BestEffortReceiver<M>) {
-        let (readers, writers): (Vec<_>, Vec<_>) = system
-            .connections()
-            .drain(..)
-            .filter_map(|x: Connection| x.split())
-            .unzip();
-
-        info!("creating best effort broadcast primitive");
-
-        let mut peer_source = system.peer_source();
-        let (mut read_tx, read_rx) = mpsc::channel(32);
-        let (mut write_tx, write_rx) = mpsc::channel(32);
-
-        task::spawn(async move {
-            loop {
-                match peer_source.next().await {
-                    Some(connection) => {
-                        if let Some((read, write)) = connection.split() {
-                            let input = read_tx.send(read).await;
-                            let output = write_tx.send(write).await;
-
-                            match (input, output) {
-                                (Ok(_), Ok(_)) => continue,
-                                (Err(_), Ok(_)) => warn!("best effort broadcast receiver dropped early"),
-                                (Ok(_), Err(_)) => warn!("best effort broadcast sender dropped  early"),
-                                (Err(_), Err(_)) => {
-                                    info!("best effort broadcast stopped");
-                                    return;
-                                },
-                            }
-                        }
-                    }
-                    None => {
-                        warn!("no new peers can be added");
-                        return;
-                    }
-                }
-            }
-        });
-
-        let receiver = BestEffortReceiver::new(readers, read_rx);
-        let broadcaster = BestEffortBroadcaster::new(writers, write_rx);
-
-        (broadcaster, receiver)
-    }
+/// An implementation of best-effort broadcasting
+pub struct BestEffort<M> {
+    delivery: Mutex<Option<mpsc::Sender<M>>>,
 }
 
-/// The sending end of the best effort broadcast primitive
-pub struct BestEffortBroadcaster {
-    connections: Vec<ConnectionWrite>,
-    peer_source: mpsc::Receiver<ConnectionWrite>,
-}
-
-impl BestEffortBroadcaster {
-    fn new(
-        connections: Vec<ConnectionWrite>,
-        peer_source: mpsc::Receiver<ConnectionWrite>,
-    ) -> Self {
+impl<M> BestEffort<M>
+where
+    M: Message,
+{
+    /// Create a new `BestEffort` broadcast primitive
+    pub fn new() -> Self {
         Self {
-            connections,
-            peer_source,
+            delivery: Default::default(),
+        }
+    }
+}
+
+impl<M> Default for BestEffort<M> {
+    fn default() -> Self {
+        Self {
+            delivery: Default::default(),
         }
     }
 }
 
 #[async_trait]
-impl<M: Message> Broadcaster<M> for BestEffortBroadcaster {
-    /// Broadcast a `Message` using the best effort strategy.
-    async fn broadcast(
+impl<M, S> Processor<M, M, M, S> for BestEffort<M>
+where
+    M: Message + 'static,
+    S: Sender<M> + 'static,
+{
+    type Handle = BestEffortHandle<M, S>;
+
+    type Error = BestEffortError;
+
+    async fn process(
+        self: Arc<Self>,
+        message: Arc<M>,
+        from: PublicKey,
+        _: Arc<S>,
+    ) -> Result<(), Self::Error> {
+        debug!("received {:?} from {}", message, from);
+
+        self.delivery
+            .lock()
+            .await
+            .as_mut()
+            .context(Setup)?
+            .send(message.deref().clone())
+            .await
+            .map_err(|_| snafu::NoneError)
+            .context(Channel)?;
+
+        Ok(())
+    }
+
+    async fn output<SA: Sampler>(
         &mut self,
-        message: &M,
-    ) -> Option<Vec<(PublicKey, SendError)>> {
-        poll_peers(&mut self.peer_source, &mut self.connections);
+        _: Arc<SA>,
+        sender: Arc<S>,
+    ) -> Self::Handle {
+        let (delivery_tx, delivery_rx) = mpsc::channel(32);
 
-        if self.connections.is_empty() {
-            return None;
-        }
+        self.delivery.lock().await.replace(delivery_tx);
 
-        let errors = future::join_all(self.connections.iter_mut().map(|c| {
-            let pkey = *c.remote_pkey();
-            let res = c
-                .send(message)
-                .instrument(debug_span!("peer", dest = %pkey));
-
-            async move { (pkey, res.await) }
-        }))
-        .instrument(debug_span!("broadcast", message = ?message))
-        .await
-        .drain(..)
-        .filter_map(|(pkey, res)| {
-            if let Err(e) = res {
-                Some((pkey, e))
-            } else {
-                None
-            }
-        })
-        .collect();
-
-        Some(errors)
-    }
-
-    fn known_peers(&self) -> HashSet<PublicKey> {
-        self.connections.iter().map(|x| *x.remote_pkey()).collect()
+        BestEffortHandle::new(delivery_rx, sender)
     }
 }
 
-/// The receiving end of the `BestEffort` broadcast primitive
-pub struct BestEffortReceiver<M: Message + 'static> {
-    connections: SelectAll<MessageStream<M>>,
-    peer_source: mpsc::Receiver<ConnectionRead>,
+/// A `Handle` for interacting with a running `BestEffort`
+pub struct BestEffortHandle<M, S>
+where
+    M: Message + 'static,
+    S: Sender<M> + 'static,
+{
+    delivery: mpsc::Receiver<M>,
+    sender: Arc<S>,
 }
 
-impl<M: Message + 'static> BestEffortReceiver<M> {
-    fn new<I: IntoIterator<Item = ConnectionRead>>(
-        readers: I,
-        peer_source: mpsc::Receiver<ConnectionRead>,
-    ) -> Self {
-        let connections = readers.into_iter().map(MessageStream::new);
-
-        let connections = stream::select_all(connections);
-
-        Self {
-            connections,
-            peer_source,
-        }
+impl<M, S> BestEffortHandle<M, S>
+where
+    M: Message + 'static,
+    S: Sender<M> + 'static,
+{
+    pub(crate) fn new(delivery: mpsc::Receiver<M>, sender: Arc<S>) -> Self {
+        Self { delivery, sender }
     }
 }
 
 #[async_trait]
-impl<M: Message + 'static> Deliverer<M> for BestEffortReceiver<M> {
-    async fn deliver(&mut self) -> Option<(PublicKey, M)> {
-        while let Ok(connection) = self.peer_source.try_recv() {
-            let stream = MessageStream::new(connection);
-            self.connections.push(stream);
-        }
+impl<M, S> Handle<M, M> for BestEffortHandle<M, S>
+where
+    M: Message + 'static,
+    S: Sender<M> + 'static,
+{
+    type Error = BestEffortError;
 
-        self.connections.next().await
+    async fn deliver(&mut self) -> Result<M, Self::Error> {
+        self.delivery.recv().await.context(Channel)
+    }
+
+    fn try_deliver(&mut self) -> Result<Option<M>, Self::Error> {
+        use tokio::sync::mpsc::error::TryRecvError;
+
+        match self.delivery.try_recv() {
+            Err(TryRecvError::Empty) => Ok(None),
+            Err(TryRecvError::Closed) => Channel.fail(),
+            Ok(message) => Ok(Some(message)),
+        }
+    }
+
+    async fn broadcast(&mut self, message: &M) -> Result<(), Self::Error> {
+        let dest = self.sender.keys().await;
+
+        self.sender
+            .clone()
+            .send_many(Arc::new(message.clone()), dest.iter())
+            .await
+            .context(Network)
     }
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::broadcast::Broadcaster;
-    use crate::test::*;
-    use crate::System;
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use drop::crypto::key::exchange::Exchanger;
-    use drop::net::TcpConnector;
+    use std::iter;
 
-    use tracing::debug_span;
-    use tracing_futures::Instrument;
+    use drop::test::*;
+
+    static SIZE: usize = 50;
 
     #[tokio::test]
-    async fn single_shot() {
-        init_logger();
-        let tcp = TcpConnector::new(Exchanger::random());
-        let mut addrs = test_addrs(10);
-        let mut public =
-            create_receivers(addrs.clone().into_iter(), |mut connection| {
-                let addr = connection.peer_addr().unwrap();
-                async move {
-                    let data: usize =
-                        connection.receive().await.expect("recv failed");
-                    assert_eq!(0, data, "wrong data received");
-                }
-                .instrument(debug_span!("client", dest=%addr))
-            })
-            .await;
-        let pkeys = public.iter().map(|x| x.0);
-        let candidates = pkeys.zip(addrs.drain(..).map(|x| x.1));
-        let system: System =
-            System::new_with_connector_zipped(&tcp, candidates).await;
+    async fn broadcast() {
+        let keys: Vec<_> = keyset(SIZE).collect();
+        let manager = DummyManager::with_key(iter::empty(), keys.clone());
+        let sender = manager.sender();
 
-        let handles = public.drain(..).map(|x| x.1);
-        let (mut sender, _) = BestEffort::with::<usize>(system);
+        let besteffort = BestEffort::new();
 
-        let errors = sender.broadcast(&0usize).await;
+        let mut handle = manager.run(besteffort).await;
 
-        assert!(
-            errors.expect("bcast failure").is_empty(),
-            "broadcast failed"
-        );
-
-        future::join_all(handles)
+        handle
+            .broadcast(&0usize)
             .await
-            .drain(..)
-            .collect::<Result<Vec<_>, _>>()
-            .expect("receiver failure");
+            .expect("failed to broadcast");
+
+        let messages = sender.messages().await;
+
+        assert_eq!(messages.len(), SIZE);
+        assert!(messages
+            .into_iter()
+            .all(|(key, x)| { keys.contains(&key) && x == Arc::new(0usize) }));
     }
 
     #[tokio::test]
-    async fn incoming_message() {
-        init_logger();
-        static DATA: AtomicUsize = AtomicUsize::new(0);
-        let tcp = TcpConnector::new(Exchanger::random());
-        let mut addrs = test_addrs(10);
-        let mut public = create_receivers(
-            addrs.clone().into_iter(),
-            |mut connection| async move {
-                let data = DATA.fetch_add(1, Ordering::AcqRel);
+    async fn delivery() {
+        let keys: Vec<_> = keyset(SIZE).collect();
+        let manager =
+            DummyManager::with_key(iter::once((keys[0], 0usize)), keys);
 
-                connection.send(&data).await.expect("recv failed");
+        let sender = manager.sender();
 
-                connection.close().await.expect("close failed");
-            },
-        )
-        .await;
-        let pkeys = public.iter().map(|x| x.0);
-        let candidates = pkeys.zip(addrs.drain(..).map(|x| x.1));
-        let system: System =
-            System::new_with_connector_zipped(&tcp, candidates).await;
+        let besteffort = BestEffort::new();
 
-        let handles = public.drain(..).map(|x| x.1);
+        let mut handle = manager.run(besteffort).await;
 
-        let (_, mut receiver) = BestEffort::with::<usize>(system);
+        let message: usize = handle.deliver().await.expect("failed to deliver");
 
-        for _ in 0..10usize {
-            let (_, data) = receiver.deliver().await.expect("early eof");
-            assert!((0..10usize).contains(&data), "invalid data broadcasted");
-        }
-
-        future::join_all(handles)
-            .await
-            .iter()
-            .for_each(|x| assert!(x.is_ok()));
+        assert_eq!(message, 0usize, "incorrect message delivered");
+        assert!(
+            sender.messages().await.is_empty(),
+            "sent messages when not supposed to"
+        );
     }
 }
